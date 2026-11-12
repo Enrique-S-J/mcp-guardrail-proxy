@@ -261,6 +261,48 @@ def test_the_upstream_dying_mid_call_fails_that_call_clearly(workspace, raw_peer
     assert lost["call_id"] == sent["call_id"]
 
 
+FILE_APPROVAL = "approval:\n  mode: file\n  directory: approvals\n  timeout_seconds: 60\n  poll_interval_seconds: 0.05\n"
+ELICITATION_APPROVAL = "approval:\n  mode: elicitation\n  timeout_seconds: 60\n"
+EMAIL = {"to": "nobody@example.test"}
+
+
+def _hold_a_call(ws, proxy, mode: str) -> int:
+    """Send a write call and return its request id once the proxy is waiting on a human for it."""
+    proxy.initialize(capabilities={"elicitation": {}} if mode == "elicitation" else None)
+    request_id = proxy.send_request("tools/call", {"name": "send_email", "arguments": EMAIL})
+    if mode == "elicitation":
+        proxy.read_request("elicitation/create")
+    else:
+        _wait_until(lambda: list(ws.approvals_dir.glob("*.json")))
+    return request_id
+
+
+@pytest.mark.parametrize("mode", ["file", "elicitation"])
+def test_the_upstream_dying_while_a_call_awaits_approval_answers_that_call(workspace, raw_peers, mode):
+    """A held call is in flight too. It gets told why it will never run, instead of a dropped connection."""
+    ws = workspace(FILE_APPROVAL if mode == "file" else ELICITATION_APPROVAL)
+    proxy = raw_peers(RawPeer.proxy(ws))
+    request_id = _hold_a_call(ws, proxy, mode)
+
+    os.kill(ws.upstream_pid(), KILL)
+
+    result = proxy.read_response(request_id)["result"]
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert "The upstream MCP server exited while the call to 'send_email' was waiting for approval" in text
+    assert "was not forwarded" in text
+    assert proxy.wait() == 4
+
+    requested, cancelled = ws.audit()
+    assert (requested["decision"], cancelled["decision"]) == ("approval_requested", "cancelled")
+    assert cancelled["call_id"] == requested["call_id"]
+    assert cancelled["upstream_status"] == "not_called"
+    assert "the upstream server exited or closed its connection" in cancelled["reason"]
+    assert ws.upstream_calls() == []
+    if mode == "file":
+        assert list(ws.approvals_dir.iterdir()) == []
+
+
 # ---------------------------------------------------------------------------
 # Audit failure
 # ---------------------------------------------------------------------------

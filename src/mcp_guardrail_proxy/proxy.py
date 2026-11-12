@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence, Union
+from typing import Any, Awaitable, Callable, Optional, Sequence, Union
 
 import anyio
 from anyio.abc import TaskGroup
@@ -51,6 +51,7 @@ _SHUTDOWN_GRACE_SECONDS = 1.0
 NOT_CALLED = "not_called"
 # The upstream_status of the line written just before a call is sent.
 PENDING = "pending"
+_UPSTREAM_LOST = "the upstream server exited or closed its connection"
 _WITHDRAWN = "the call was withdrawn while approval was pending (cancelled by the client, or the proxy was stopping)"
 
 CallResult = Union[types.CallToolResult, types.InputRequiredResult]
@@ -153,6 +154,8 @@ class GuardrailProxy:
             FileApprover.prepare_directory(self._file_approver.directory)
         self._pending_elicitations: dict[str, _PendingElicitation] = {}
         self._tasks: Optional[TaskGroup] = None
+        # One scope per call currently waiting on a human.
+        self._approval_waits: set[anyio.CancelScope] = set()
         self._in_flight = 0
         self._stop = anyio.Event()
         self._fatal: Optional[tuple[int, str]] = None
@@ -205,18 +208,20 @@ class GuardrailProxy:
         if self._fatal is None:
             return EXIT_OK
         code, message = self._fatal
-        log(f"{message}; exiting with status {code}")
+        hint = " (its own error output, if any, is above)" if code == EXIT_UPSTREAM_LOST else ""
+        log(f"{message}{hint}; exiting with status {code}")
         return code
 
     async def _watch_upstream(self) -> None:
         await self._upstream.closed.wait()
-        self._fail(
-            EXIT_UPSTREAM_LOST,
-            "the upstream server exited or closed its connection (its own error output, if any, is above)",
-        )
+        self._fail(EXIT_UPSTREAM_LOST, _UPSTREAM_LOST)
 
     async def _stop_when_fatal(self, scope: anyio.CancelScope) -> None:
         await self._stop.wait()
+        # A call held for approval would otherwise sit out the grace period
+        # and be cut off without an answer.
+        for wait in list(self._approval_waits):
+            wait.cancel()
         # Calls that were in flight fail fast once the cause is known; let
         # their error results reach the client before the wire goes away.
         with anyio.move_on_after(_SHUTDOWN_GRACE_SECONDS):
@@ -307,28 +312,76 @@ class GuardrailProxy:
                 ),
             )
         if mode == "file":
-            assert self._file_approver is not None
-            self._record(call_id, name, arguments, started, decision="approval_requested", rule=decision.rule)
-            log(f"approval needed for '{name}' (request {call_id}); waiting on {self._file_approver.directory}")
-            try:
-                outcome = await self._file_approver.request(
-                    call_id=call_id, tool=name, arguments=self._redact(arguments)
-                )
-            except Exception as exc:
-                outcome = self._approval_failed(name, call_id, exc)
-            except anyio.get_cancelled_exc_class():
-                self._record(
-                    call_id,
-                    name,
-                    arguments,
-                    started,
-                    decision="cancelled",
-                    rule=decision.rule,
-                    reason=_WITHDRAWN,
-                )
-                raise
-            return await self._conclude(call_id, name, arguments, started, decision.rule, outcome)
+            approver = self._file_approver
+            assert approver is not None
+
+            async def ask_in_directory() -> ApprovalOutcome:
+                log(f"approval needed for '{name}' (request {call_id}); waiting on {approver.directory}")
+                return await approver.request(call_id=call_id, tool=name, arguments=self._redact(arguments))
+
+            return await self._hold(call_id, name, arguments, started, decision.rule, ask_in_directory)
         return await self._elicit(ctx, params, call_id, started, decision.rule)
+
+    async def _hold(
+        self,
+        call_id: str,
+        name: str,
+        arguments: Optional[dict[str, Any]],
+        started: float,
+        rule: str,
+        ask: Callable[[], Awaitable[ApprovalOutcome]],
+    ) -> types.CallToolResult:
+        """Hold a call until `ask` comes back with an answer, then act on it.
+
+        The wait ends early in two ways, and they are told apart. The client
+        withdrawing the call arrives as cancellation from outside and is
+        re-raised. The proxy starting to stop cancels only this wait (see
+        `_stop_when_fatal`), so the handler is still running and can answer
+        the call: a held call is in flight as much as a forwarded one, and it
+        is owed a reason instead of a dropped connection.
+        """
+        self._record(call_id, name, arguments, started, decision="approval_requested", rule=rule)
+        outcome: Optional[ApprovalOutcome] = None
+        try:
+            with anyio.CancelScope() as wait:
+                self._approval_waits.add(wait)
+                if self._stop.is_set():
+                    wait.cancel()
+                try:
+                    outcome = await ask()
+                except Exception as exc:
+                    outcome = self._approval_failed(name, call_id, exc)
+                finally:
+                    self._approval_waits.discard(wait)
+        except anyio.get_cancelled_exc_class():
+            self._record(call_id, name, arguments, started, decision="cancelled", rule=rule, reason=_WITHDRAWN)
+            raise
+        if outcome is None:
+            return self._stopped_while_held(call_id, name, arguments, started, rule)
+        return await self._conclude(call_id, name, arguments, started, rule, outcome)
+
+    def _stopped_while_held(
+        self, call_id: str, name: str, arguments: Optional[dict[str, Any]], started: float, rule: str
+    ) -> types.CallToolResult:
+        code, cause = self._fatal if self._fatal is not None else (EXIT_OK, "the proxy is stopping")
+        self._record(
+            call_id,
+            name,
+            arguments,
+            started,
+            decision="cancelled",
+            rule=rule,
+            reason=f"approval was still pending when the proxy began to stop: {cause}",
+        )
+        if code == EXIT_UPSTREAM_LOST:
+            return _error_result(
+                f"The upstream MCP server exited while the call to '{name}' was waiting for approval, so "
+                "the call was not forwarded. mcp-guardrail-proxy is shutting down. Restart the server to continue."
+            )
+        return _error_result(
+            f"mcp-guardrail-proxy is shutting down ({cause}). The call to '{name}' was waiting for "
+            "approval and was not forwarded."
+        )
 
     # -- elicitation -------------------------------------------------------
 
@@ -370,37 +423,29 @@ class GuardrailProxy:
         timeout = self._policy.approval.timeout_seconds
 
         if ctx.session.can_send_request:
-            self._record(call_id, name, arguments, started, decision="approval_requested", rule=rule)
-            question = elicitation_params(name, self._redact(arguments))
-            try:
-                with anyio.fail_after(timeout):
-                    answer = await ctx.session.elicit_form(
-                        question.message, question.requested_schema, related_request_id=ctx.request_id
+
+            async def ask_through_client() -> ApprovalOutcome:
+                question = elicitation_params(name, self._redact(arguments))
+                try:
+                    with anyio.fail_after(timeout):
+                        answer = await ctx.session.elicit_form(
+                            question.message, question.requested_schema, related_request_id=ctx.request_id
+                        )
+                except TimeoutError:
+                    return ApprovalOutcome("timeout")
+                except MCPError as exc:
+                    # The code only, for the same reason as an upstream error's
+                    # message: the text belongs to the other side.
+                    return ApprovalOutcome(
+                        "denied",
+                        None,
+                        f"the client answered the approval prompt with JSON-RPC error {exc.error.code}",
                     )
-                outcome = outcome_from_elicitation(answer, client_name)
-            except TimeoutError:
-                outcome = ApprovalOutcome("timeout")
-            except MCPError as exc:
-                # The code only, for the same reason as an upstream error's
-                # message: the text belongs to the other side.
-                outcome = ApprovalOutcome(
-                    "denied", None, f"the client answered the approval prompt with JSON-RPC error {exc.error.code}"
-                )
-            except Exception as exc:
-                # Typically an answer that is not an elicitation result at all.
-                outcome = self._approval_failed(name, call_id, exc)
-            except anyio.get_cancelled_exc_class():
-                self._record(
-                    call_id,
-                    name,
-                    arguments,
-                    started,
-                    decision="cancelled",
-                    rule=rule,
-                    reason=_WITHDRAWN,
-                )
-                raise
-            return await self._conclude(call_id, name, arguments, started, rule, outcome)
+                # An answer that is not an elicitation result at all raises
+                # out of elicit_form, and is a failed request to `_hold`.
+                return outcome_from_elicitation(answer, client_name)
+
+            return await self._hold(call_id, name, arguments, started, rule, ask_through_client)
 
         # Multi-round-trip. The state sent to the client is only the random
         # id of an entry held here; the entry carries what was asked about,
@@ -600,10 +645,7 @@ class GuardrailProxy:
         except MCPError as exc:
             if exc.error.code == types.CONNECTION_CLOSED or self._upstream.closed.is_set():
                 record_outcome("connection_lost", "the upstream server exited before answering")
-                self._fail(
-                    EXIT_UPSTREAM_LOST,
-                    "the upstream server exited or closed its connection (its own error output, if any, is above)",
-                )
+                self._fail(EXIT_UPSTREAM_LOST, _UPSTREAM_LOST)
                 return _error_result(
                     f"The upstream MCP server exited before answering the call to '{name}'. "
                     "mcp-guardrail-proxy is shutting down; whether the call took effect is unknown. "
