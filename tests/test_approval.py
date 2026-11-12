@@ -17,7 +17,7 @@ import anyio
 import pytest
 from mcp import types
 
-from harness import STEP_TIMEOUT, connect, connect_modern, wait_for
+from harness import STEP_TIMEOUT, RawPeer, connect, connect_modern, wait_for
 
 FILE_POLICY = """
 default: require_approval
@@ -414,6 +414,48 @@ async def test_elicitation_with_a_client_that_cannot_elicit_blocks_the_call(work
     assert entry["rule"] == "default: require_approval (approval.mode: elicitation, unsupported by client)"
 
 
+def test_a_client_that_only_offers_url_elicitation_is_refused(workspace, raw_peers):
+    """The approval prompt is a form. A client that can only open URLs cannot show it."""
+    ws = workspace(ELICIT_POLICY.format(timeout=STEP_TIMEOUT))
+    proxy = raw_peers(RawPeer.proxy(ws))
+    proxy.initialize(capabilities={"elicitation": {"url": {}}})
+    result = proxy.request("tools/call", {"name": "send_email", "arguments": EMAIL})["result"]
+
+    assert result["isError"] is True
+    assert "this client did not declare support for form elicitation" in result["content"][0]["text"]
+    assert ws.upstream_calls() == []
+    (entry,) = ws.audit()
+    assert entry["decision"] == "deny"
+    assert entry["rule"] == "default: require_approval (approval.mode: elicitation, unsupported by client)"
+
+
+def test_a_client_that_answers_the_prompt_with_an_error_does_not_get_the_call_through(workspace, raw_peers):
+    """The client declares elicitation, then answers elicitation/create with a JSON-RPC error. That is not a yes."""
+    ws = workspace(ELICIT_POLICY.format(timeout=STEP_TIMEOUT))
+    proxy = raw_peers(RawPeer.proxy(ws))
+    proxy.initialize(capabilities={"elicitation": {}})
+    call = proxy.send_request("tools/call", {"name": "send_email", "arguments": EMAIL})
+    prompt = proxy.read_request("elicitation/create")
+    proxy.send(
+        {
+            "jsonrpc": "2.0",
+            "id": prompt["id"],
+            "error": {"code": -32603, "message": "the dialog crashed while showing nested-secret"},
+        }
+    )
+    result = proxy.read_response(call)["result"]
+
+    assert result["isError"] is True
+    assert "the request was denied" in result["content"][0]["text"]
+    assert ws.upstream_calls() == []
+    requested, denied = ws.audit()
+    assert (requested["decision"], denied["decision"]) == ("approval_requested", "denied")
+    assert denied["upstream_status"] == "not_called"
+    # The error's code is recorded; its text, which is the client's, is not.
+    assert denied["reason"] == "the client answered the approval prompt with JSON-RPC error -32603"
+    assert "nested-secret" not in ws.audit_path.read_text()
+
+
 async def test_elicitation_times_out_if_the_client_never_answers(workspace):
     ws = workspace(ELICIT_POLICY.format(timeout=0.4))
 
@@ -475,6 +517,22 @@ async def test_elicitation_over_the_2026_protocol_forwards_an_approved_call(work
     assert approved["call_id"] == sent["call_id"] == requested["call_id"]
 
 
+async def test_the_question_over_the_2026_protocol_shows_redacted_arguments(workspace):
+    """The prompt is one more place arguments are written out for someone to read."""
+    ws = workspace(ELICIT_POLICY.format(timeout=STEP_TIMEOUT))
+
+    async def noop(context, params):
+        raise AssertionError("not used")
+
+    async with connect_modern(ws, elicitation_callback=noop) as client:
+        question = await client.session.call_tool("send_email", EMAIL, allow_input_required=True)
+
+    assert isinstance(question, types.InputRequiredResult)
+    message = question.input_requests["approval"].params.message
+    assert "'send_email'" in message and "mail.example.test" in message
+    assert "[REDACTED]" in message and "nested-secret" not in message
+
+
 async def test_elicitation_over_the_2026_protocol_blocks_a_declined_call(workspace):
     ws = workspace(ELICIT_POLICY.format(timeout=STEP_TIMEOUT))
     callback, _ = _answering("decline")
@@ -516,6 +574,13 @@ async def test_an_approval_cannot_be_replayed_moved_or_invented(workspace):
         assert isinstance(question, types.InputRequiredResult)
         moved = await call(other, input_responses=yes, request_state=question.request_state)
         assert isinstance(moved, types.InputRequiredResult)
+        assert ws.upstream_calls() == []
+
+        # The same question, answered, but for another tool with the very same arguments.
+        other_tool = await session.call_tool(
+            "delete_record", EMAIL, allow_input_required=True, input_responses=yes, request_state=question.request_state
+        )
+        assert isinstance(other_tool, types.InputRequiredResult)
         assert ws.upstream_calls() == []
 
         # Used as intended: forwarded once.

@@ -157,29 +157,43 @@ class RawPeer:
         self.send(message)
         return self._next_id
 
-    def read_response(self, request_id: int, timeout: float = STEP_TIMEOUT) -> dict[str, Any]:
-        """The response to `request_id`, skipping anything else the peer says first."""
+    def _read_until(self, wanted, what: str, timeout: float) -> dict[str, Any]:
+        """The next message for which `wanted(message)` holds, skipping anything else the peer says first."""
         deadline = time.monotonic() + timeout
         while True:
             try:
                 line = self._lines.get(timeout=max(0.0, deadline - time.monotonic()))
             except queue.Empty:
-                raise AssertionError(f"no response to request {request_id} within {timeout}s") from None
+                raise AssertionError(f"no {what} within {timeout}s") from None
             if line is None:
-                raise AssertionError(f"peer closed stdout before answering request {request_id}")
+                raise AssertionError(f"peer closed stdout before sending {what}")
             message = json.loads(line)
-            if message.get("id") == request_id and "method" not in message:
+            if wanted(message):
                 return message
+
+    def read_response(self, request_id: int, timeout: float = STEP_TIMEOUT) -> dict[str, Any]:
+        """The response to `request_id`."""
+        return self._read_until(
+            lambda message: message.get("id") == request_id and "method" not in message,
+            f"response to request {request_id}",
+            timeout,
+        )
+
+    def read_request(self, method: str, timeout: float = STEP_TIMEOUT) -> dict[str, Any]:
+        """The next request the peer sends us with this method."""
+        return self._read_until(
+            lambda message: message.get("method") == method and "id" in message, f"'{method}' request", timeout
+        )
 
     def request(self, method: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         return self.read_response(self.send_request(method, params))
 
-    def initialize(self) -> dict[str, Any]:
+    def initialize(self, capabilities: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         response = self.request(
             "initialize",
             {
                 "protocolVersion": "2025-11-25",
-                "capabilities": {},
+                "capabilities": capabilities or {},
                 "clientInfo": {"name": "raw-test-client", "version": "0"},
             },
         )

@@ -12,10 +12,11 @@ against that log, not against the proxy's own account of what it did.
 
 import sys
 
+import anyio
 import pytest
 from mcp import ClientSession, MCPError, StdioServerParameters, stdio_client
 
-from harness import FAKE_UPSTREAM, RawPeer, connect, connect_modern
+from harness import FAKE_UPSTREAM, RawPeer, connect, connect_modern, wait_for
 
 ALLOW_NOTHING_BUT_READS = "default: deny\n"
 
@@ -246,6 +247,67 @@ async def test_an_upstream_protocol_error_reaches_the_client_unchanged(workspace
     assert entry["reason"] == "the upstream answered with JSON-RPC error -32602"
 
 
+MALFORMED_RESULT_UPSTREAM = r'''
+import json, sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    if "id" not in message:
+        continue
+    if message["method"] == "initialize":
+        result = {
+            "protocolVersion": message["params"]["protocolVersion"],
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "malformed_result_upstream", "version": "0"},
+        }
+    elif message["method"] == "tools/list":
+        result = {"tools": [{"name": "odd", "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": True}}]}
+    else:
+        result = {"content": "not a list of content blocks", "isError": "maybe"}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}) + "\n")
+    sys.stdout.flush()
+'''
+
+
+def test_an_upstream_answer_that_is_not_a_tool_result_is_reported_and_logged(workspace, raw_peers):
+    """The upstream answers tools/call with something that is not a CallToolResult at all."""
+    ws = workspace(ALLOW_NOTHING_BUT_READS)
+    script = ws.dir / "malformed_result_upstream.py"
+    script.write_text(MALFORMED_RESULT_UPSTREAM)
+    proxied = raw_peers(RawPeer.proxy(ws, upstream=[sys.executable, str(script)]))
+    proxied.initialize()
+
+    result = proxied.request("tools/call", {"name": "odd", "arguments": {}})["result"]
+    assert result["isError"] is True
+    assert "answered the call to 'odd' with something that is not a valid tool result" in result["content"][0]["text"]
+
+    sent, answered = ws.audit()
+    assert (sent["decision"], sent["upstream_status"]) == ("allow", "pending")
+    assert (answered["decision"], answered["upstream_status"]) == ("allow", "invalid_response")
+    assert "not a valid tool result" in answered["reason"]
+    # One bad answer is not a reason to stop serving.
+    assert proxied.request("tools/list")["result"]["tools"][0]["name"] == "odd"
+
+
+async def test_cancelling_a_call_after_it_was_forwarded_is_logged_as_cancelled(workspace):
+    """The client gives up on a write the upstream is already working on. The log must not lose the call."""
+    ws = workspace("default: allow\n")
+    async with connect(ws) as session:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(session.call_tool, "slow_write", {"seconds": 60})
+            await wait_for(lambda: ws.upstream_calls() == [{"tool": "slow_write", "arguments": {"seconds": 60}}])
+            tg.cancel_scope.cancel()
+        await wait_for(lambda: len(ws.audit()) == 2)
+        # The session is still good for the next call.
+        assert (await session.call_tool("get_status", {})).is_error is False
+
+    sent, cancelled = ws.audit()[:2]
+    assert (sent["tool"], sent["decision"], sent["upstream_status"]) == ("slow_write", "allow", "pending")
+    assert (cancelled["decision"], cancelled["upstream_status"]) == ("allow", "cancelled")
+    assert cancelled["call_id"] == sent["call_id"]
+    assert "its effect is unknown" in cancelled["reason"]
+
+
 async def test_the_upstream_inherits_the_proxys_environment(workspace):
     """Credentials a client config sets for the upstream land on the proxy, and must be handed on."""
     ws = workspace(ALLOW_NOTHING_BUT_READS)
@@ -361,6 +423,19 @@ async def test_a_tool_the_upstream_did_not_list_at_startup_is_denied(workspace):
     assert ws.upstream_calls() == []
     (entry,) = ws.audit()
     assert (entry["decision"], entry["rule"], entry["upstream_status"]) == ("deny", "unknown_tool", "not_called")
+
+
+async def test_an_explicit_allow_does_not_reach_a_tool_the_upstream_did_not_list(workspace):
+    """A rule naming the tool does not change that the proxy never saw it described."""
+    ws = workspace("default: deny\ntools:\n  late_addition: allow\n")
+    async with connect(ws) as session:
+        result = await session.call_tool("late_addition", {})
+
+    assert result.is_error is True
+    assert "restart the proxy" in _text(result)
+    assert ws.upstream_calls() == []
+    (entry,) = ws.audit()
+    assert (entry["decision"], entry["rule"]) == ("deny", "unknown_tool")
 
 
 async def test_a_policy_rule_for_a_tool_the_upstream_lacks_is_flagged_at_startup(workspace):
