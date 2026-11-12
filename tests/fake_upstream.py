@@ -17,7 +17,8 @@ sees only half of them):
                     With format="long" its structured result omits a field its
                     own output schema requires.
     send_email      write; echoes its arguments back
-    delete_record   write, destructive; a JSON-RPC error if record_id is missing
+    delete_record   write, destructive; a JSON-RPC error if record_id is missing,
+                    and one that quotes the arguments back if it is not a string
     slow_write      write; sleeps for `seconds` before answering
     plain_tool      no annotations at all
 
@@ -153,6 +154,12 @@ async def call_tool(ctx: Any, params: types.CallToolRequestParams) -> types.Call
     if params.name == "delete_record":
         if "record_id" not in arguments:
             raise MCPError(code=types.INVALID_PARAMS, message="record_id is required", data={"field": "record_id"})
+        if not isinstance(arguments["record_id"], str):
+            # A validator that echoes what it rejected, as many do.
+            raise MCPError(
+                code=types.INVALID_PARAMS,
+                message=f"record_id must be a string; got arguments {json.dumps(arguments, sort_keys=True)}",
+            )
         return _text(f"deleted {arguments.get('record_id')}")
     if params.name == "slow_write":
         await anyio.sleep(float(arguments.get("seconds", 30)))

@@ -242,7 +242,8 @@ async def test_an_upstream_protocol_error_reaches_the_client_unchanged(workspace
     assert exc.value.error.data == {"field": "record_id"}
     _, entry = ws.audit()
     assert (entry["decision"], entry["upstream_status"]) == ("allow", "protocol_error")
-    assert "record_id is required" in entry["reason"]
+    # The code is recorded; the upstream's message is not (it is upstream output, like a result).
+    assert entry["reason"] == "the upstream answered with JSON-RPC error -32602"
 
 
 async def test_the_upstream_inherits_the_proxys_environment(workspace):
@@ -410,6 +411,28 @@ async def test_blocked_calls_are_redacted_in_the_log_too(workspace):
     async with connect(ws) as session:
         await session.call_tool("send_email", {"to": "x@example.test", "smtp": {"password": "nested-secret"}})
     assert "nested-secret" not in ws.audit_path.read_text()
+
+
+async def test_an_upstream_error_that_quotes_its_input_does_not_put_secrets_in_the_log(workspace):
+    """The upstream rejects the call and echoes the arguments, password included, in its error message.
+
+    The client gets that message as sent; it supplied the password in the
+    first place. The log must not: redacting `arguments` is worth nothing if
+    the same value is written two fields along.
+    """
+    ws = workspace("default: allow\nredact_fields: [password]\n")
+    arguments = {"record_id": 7, "auth": {"password": "echoed-secret"}}
+    async with connect(ws) as session:
+        with pytest.raises(MCPError) as exc:
+            await session.call_tool("delete_record", arguments)
+    assert "echoed-secret" in exc.value.error.message
+
+    assert ws.upstream_calls() == [{"tool": "delete_record", "arguments": arguments}]
+    assert "echoed-secret" not in ws.audit_path.read_text()
+    _, entry = ws.audit()
+    assert entry["arguments"] == {"record_id": 7, "auth": {"password": "[REDACTED]"}}
+    assert entry["upstream_status"] == "protocol_error"
+    assert entry["reason"] == "the upstream answered with JSON-RPC error -32602"
 
 
 async def test_every_line_is_valid_json_appended_in_order(workspace):

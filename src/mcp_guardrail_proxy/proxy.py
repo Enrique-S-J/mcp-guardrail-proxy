@@ -372,7 +372,11 @@ class GuardrailProxy:
             except TimeoutError:
                 outcome = ApprovalOutcome("timeout")
             except MCPError as exc:
-                outcome = ApprovalOutcome("denied", None, f"the client rejected the approval prompt: {exc}")
+                # The code only, for the same reason as an upstream error's
+                # message: the text belongs to the other side.
+                outcome = ApprovalOutcome(
+                    "denied", None, f"the client answered the approval prompt with JSON-RPC error {exc.error.code}"
+                )
             except anyio.get_cancelled_exc_class():
                 self._record(
                     call_id,
@@ -553,8 +557,11 @@ class GuardrailProxy:
                 )
             # A protocol-level error from the upstream (bad arguments, a tool
             # it no longer has). Passed on as the same error the client would
-            # have received from the upstream directly.
-            record_outcome("protocol_error", f"upstream error {exc.error.code}: {exc.error.message}")
+            # have received from the upstream directly. Only the code is
+            # logged: the message is the upstream's own text, and a validator
+            # that quotes the input it rejected would carry a redacted
+            # argument into the log through this field.
+            record_outcome("protocol_error", f"the upstream answered with JSON-RPC error {exc.error.code}")
             raise
         except anyio.get_cancelled_exc_class():
             try:
