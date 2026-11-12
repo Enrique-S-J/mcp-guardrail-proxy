@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import signal
 import sys
 import time
 import uuid
@@ -43,6 +44,13 @@ EXIT_CONFIG = 2
 EXIT_UPSTREAM_START = 3
 EXIT_UPSTREAM_LOST = 4
 EXIT_AUDIT = 5
+# Ctrl-C taken as KeyboardInterrupt instead of through the signal receiver.
+EXIT_INTERRUPTED = 128 + signal.SIGINT
+
+# Signals that mean "stop now". Handled, not left to their default action,
+# which would end the process with calls still held, their request files still
+# on disk, and nothing in the log to say what became of them.
+_STOP_SIGNALS = tuple(getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, name))
 
 # How long in-flight calls get to send their error result to the client after
 # a fatal condition, before the proxy stops serving.
@@ -198,6 +206,7 @@ class GuardrailProxy:
             async with anyio.create_task_group() as tg:
                 self._tasks = tg
                 tg.start_soon(self._watch_upstream)
+                tg.start_soon(self._watch_signals)
                 tg.start_soon(self._stop_when_fatal, tg.cancel_scope)
                 async with stdio_server(stdin=_WireInput()) as (read_stream, write_stream):  # type: ignore[arg-type]
                     await server.run(read_stream, write_stream, server.create_initialization_options())
@@ -215,6 +224,24 @@ class GuardrailProxy:
     async def _watch_upstream(self) -> None:
         await self._upstream.closed.wait()
         self._fail(EXIT_UPSTREAM_LOST, _UPSTREAM_LOST)
+
+    async def _watch_signals(self) -> None:
+        """Turn a stop signal into the same orderly stop as any other fatal condition.
+
+        The exit status is the shell's convention for death by signal, 128 +
+        N, so a supervisor sees the same number it would have seen from the
+        default action.
+        """
+        try:
+            with anyio.open_signal_receiver(*_STOP_SIGNALS) as received:
+                # Keeps listening: a second Ctrl-C from an impatient operator
+                # must not cut the stop short half-way through.
+                async for signum in received:
+                    self._fail(128 + signum, f"received {signal.Signals(signum).name}")
+        except NotImplementedError:
+            # Event loops without signal support (Windows). Ctrl-C then
+            # arrives as KeyboardInterrupt and is dealt with in __main__.
+            return
 
     async def _stop_when_fatal(self, scope: anyio.CancelScope) -> None:
         await self._stop.wait()

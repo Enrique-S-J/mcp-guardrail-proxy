@@ -5,7 +5,8 @@ the things under test are the ones an SDK client hides: how the process was
 invoked, what it printed on stderr, and the status it exited with.
 
 Exit statuses: 0 client disconnected, 2 bad configuration, 3 upstream did not
-start, 4 upstream went away mid-session, 5 audit log could not be written.
+start, 4 upstream went away mid-session, 5 audit log could not be written,
+128 + N stopped by signal N.
 """
 
 import os
@@ -301,6 +302,100 @@ def test_the_upstream_dying_while_a_call_awaits_approval_answers_that_call(works
     assert ws.upstream_calls() == []
     if mode == "file":
         assert list(ws.approvals_dir.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Signals
+# ---------------------------------------------------------------------------
+
+posix_only = pytest.mark.skipif(os.name == "nt", reason="POSIX signals")
+STOP_SIGNALS = pytest.mark.parametrize(
+    "signum,status", [(signal.SIGINT, 130), (signal.SIGTERM, 143)], ids=["SIGINT", "SIGTERM"]
+)
+
+
+def _process_is_gone(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+@posix_only
+@STOP_SIGNALS
+def test_a_stop_signal_ends_the_proxy_promptly_and_takes_the_upstream_with_it(workspace, raw_peers, signum, status):
+    """Ctrl-C or a `kill`, with the client still connected and its stdin still open."""
+    ws = workspace("default: deny\n")
+    proxy = raw_peers(RawPeer.proxy(ws))
+    proxy.initialize()
+    upstream_pid = ws.upstream_pid()
+
+    proxy.proc.send_signal(signum)
+
+    assert proxy.wait(timeout=10) == status
+    assert f"received {signum.name}; exiting with status {status}" in ws.stderr()
+    assert "Traceback" not in ws.stderr()
+    _wait_until(lambda: _process_is_gone(upstream_pid))
+
+
+@posix_only
+@STOP_SIGNALS
+def test_a_stop_signal_answers_and_closes_out_a_call_awaiting_approval(workspace, raw_peers, signum, status):
+    """The request must not be left in the approvals directory for someone to approve into the void."""
+    ws = workspace(FILE_APPROVAL)
+    proxy = raw_peers(RawPeer.proxy(ws))
+    request_id = _hold_a_call(ws, proxy, "file")
+
+    proxy.proc.send_signal(signum)
+
+    result = proxy.read_response(request_id)["result"]
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert f"mcp-guardrail-proxy is shutting down (received {signum.name})" in text
+    assert "was not forwarded" in text
+    assert proxy.wait(timeout=10) == status
+
+    requested, cancelled = ws.audit()
+    assert (requested["decision"], cancelled["decision"]) == ("approval_requested", "cancelled")
+    assert cancelled["call_id"] == requested["call_id"]
+    assert f"received {signum.name}" in cancelled["reason"]
+    assert ws.upstream_calls() == []
+    assert list(ws.approvals_dir.iterdir()) == []
+
+
+@posix_only
+def test_a_stop_signal_closes_the_record_of_a_call_already_at_the_upstream(workspace, raw_peers):
+    ws = workspace("default: allow\n")
+    proxy = raw_peers(RawPeer.proxy(ws))
+    proxy.initialize()
+    proxy.send_request("tools/call", {"name": "slow_write", "arguments": {"seconds": 60}})
+    _wait_until(lambda: ws.upstream_calls() == [{"tool": "slow_write", "arguments": {"seconds": 60}}])
+
+    proxy.proc.send_signal(signal.SIGTERM)
+
+    assert proxy.wait(timeout=10) == 143
+    sent, cancelled = ws.audit()
+    assert (sent["decision"], sent["upstream_status"]) == ("allow", "pending")
+    assert (cancelled["decision"], cancelled["upstream_status"]) == ("allow", "cancelled")
+    assert cancelled["call_id"] == sent["call_id"]
+    assert "its effect is unknown" in cancelled["reason"]
+
+
+@posix_only
+def test_ctrl_c_while_the_upstream_is_still_starting_exits_130_without_a_traceback(workspace, raw_peers):
+    """Before the proxy is serving there is nothing to close out, but it still has to leave cleanly."""
+    ws = workspace("default: deny\n")
+    marker = ws.dir / "upstream-started"
+    silent = [sys.executable, "-c", f"import pathlib, time; pathlib.Path({str(marker)!r}).touch(); time.sleep(60)"]
+    proxy = raw_peers(RawPeer.proxy(ws, upstream=silent))
+    _wait_until(marker.exists)
+
+    proxy.proc.send_signal(signal.SIGINT)
+
+    assert proxy.wait(timeout=10) == 130
+    assert "interrupted; exiting with status 130" in ws.stderr()
+    assert "Traceback" not in ws.stderr()
 
 
 # ---------------------------------------------------------------------------

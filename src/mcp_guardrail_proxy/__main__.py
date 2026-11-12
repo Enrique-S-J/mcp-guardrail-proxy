@@ -22,7 +22,7 @@ from . import __version__
 from .approval import FileApprover
 from .audit import AuditError, AuditLog, make_redactor
 from .policy import PolicyError, load_policy
-from .proxy import EXIT_CONFIG, EXIT_OK, log, run_proxy
+from .proxy import EXIT_CONFIG, EXIT_INTERRUPTED, EXIT_OK, log, run_proxy
 
 
 def _parse_args(argv: Sequence[str]) -> tuple[argparse.Namespace, list[str]]:
@@ -110,7 +110,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             log(f"error: cannot use approvals directory '{policy.approval.directory}': {exc.strerror or exc}")
             sys.exit(EXIT_CONFIG)
 
-    status = anyio.run(lambda: run_proxy(command, policy, audit, redact, startup_timeout=args.startup_timeout))
+    try:
+        status = anyio.run(lambda: run_proxy(command, policy, audit, redact, startup_timeout=args.startup_timeout))
+    except KeyboardInterrupt:
+        # Ctrl-C while no signal receiver was listening: the upstream was
+        # still starting, or the event loop has no signal support (Windows).
+        # The event loop has already unwound and shut the upstream down.
+        log(f"interrupted; exiting with status {EXIT_INTERRUPTED}")
+        status = EXIT_INTERRUPTED
     if status == EXIT_OK:
         sys.exit(EXIT_OK)
     # A failure exit can come while the client still holds our stdin open, in
