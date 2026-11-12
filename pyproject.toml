@@ -1,0 +1,42 @@
+[build-system]
+# 77 is the first setuptools that reads `license` as an SPDX string.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-guardrail-proxy"
+version = "0.1.0"
+description = "Policy and audit middleware for MCP: wraps any MCP server, passes read-only tools through, and gates write-capable tools behind an approval step with a full audit log."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Enrique Sanchez" }]
+keywords = ["mcp", "model-context-protocol", "ai-safety", "guardrails", "ai-agents", "audit-logging"]
+dependencies = [
+    # Written against the 2.x API on both sides: the low-level Server with
+    # constructor-registered handlers, and ClientSession over stdio_client.
+    # Developed and tested against 2.3.0.
+    "mcp>=2,<3",
+    "pydantic>=2,<3",
+    # The policy file is YAML and mcp does not bring a YAML parser with it.
+    "pyyaml>=6,<7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+mcp-guardrail-proxy = "mcp_guardrail_proxy.__main__:main"
+mcp-guardrail-approve = "mcp_guardrail_proxy.approval:approve_main"
+
+[project.urls]
+Repository = "https://github.com/Enrique-S-J/mcp-guardrail-proxy"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
