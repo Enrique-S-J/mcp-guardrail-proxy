@@ -172,6 +172,16 @@ def test_an_unwritable_audit_path_stops_the_proxy_at_startup(workspace):
     assert not ws.pid_path.exists()
 
 
+def test_an_unusable_approvals_directory_stops_the_proxy_at_startup(workspace):
+    """Found at startup, not when the first write tool is called."""
+    ws = workspace("approval:\n  mode: file\n  directory: approvals\n")
+    ws.approvals_dir.write_text("a file where the directory should be")
+    result = _run_proxy(*ws.proxy_argv())
+    assert result.returncode == 2
+    assert "cannot use approvals directory" in result.stderr
+    assert not ws.pid_path.exists()
+
+
 # ---------------------------------------------------------------------------
 # Upstream failures
 # ---------------------------------------------------------------------------

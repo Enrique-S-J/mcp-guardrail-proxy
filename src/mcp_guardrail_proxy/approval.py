@@ -99,9 +99,12 @@ class FileApprover:
         self.timeout_seconds = timeout_seconds
         self.poll_interval_seconds = poll_interval_seconds
 
-    def prepare(self) -> None:
-        """Create the approvals directory, private to the current user."""
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    @staticmethod
+    def prepare_directory(directory: Path) -> None:
+        """Create the approvals directory, private to the current user, and check it is usable."""
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not os.access(directory, os.W_OK | os.X_OK):
+            raise PermissionError(13, "Permission denied", str(directory))
 
     def pending_path(self, call_id: str) -> Path:
         return self.directory / f"{call_id}{PENDING_SUFFIX}"

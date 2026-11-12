@@ -142,7 +142,7 @@ class GuardrailProxy:
                 timeout_seconds=policy.approval.timeout_seconds,
                 poll_interval_seconds=policy.approval.poll_interval_seconds,
             )
-            self._file_approver.prepare()
+            FileApprover.prepare_directory(self._file_approver.directory)
         self._pending_elicitations: dict[str, _PendingElicitation] = {}
         self._in_flight = 0
         self._stop = anyio.Event()

@@ -150,8 +150,9 @@ async def test_a_denial_wins_when_both_answers_exist(workspace):
     ws = workspace(FILE_POLICY.format(timeout=STEP_TIMEOUT))
 
     def both(pending):
-        # Written to a temp name and renamed, so both appear between two polls.
-        for suffix in ("approved", "denied"):
+        # Staged elsewhere and renamed in. The denial goes first, so no poll can
+        # land between the two renames and see an approval alone.
+        for suffix in ("denied", "approved"):
             staged = ws.dir / f"staged.{suffix}"
             staged.write_text("{}")
             staged.rename(ws.approvals_dir / f"{pending['id']}.{suffix}")

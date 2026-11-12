@@ -19,6 +19,7 @@ from typing import Optional, Sequence
 import anyio
 
 from . import __version__
+from .approval import FileApprover
 from .audit import AuditError, AuditLog, make_redactor
 from .policy import PolicyError, load_policy
 from .proxy import EXIT_CONFIG, EXIT_OK, log, run_proxy
@@ -102,6 +103,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     except AuditError as exc:
         log(f"error: {exc}")
         sys.exit(EXIT_CONFIG)
+    if policy.approval.mode == "file":
+        try:
+            FileApprover.prepare_directory(policy.approval.directory)
+        except OSError as exc:
+            log(f"error: cannot use approvals directory '{policy.approval.directory}': {exc.strerror or exc}")
+            sys.exit(EXIT_CONFIG)
 
     status = anyio.run(lambda: run_proxy(command, policy, audit, redact, startup_timeout=args.startup_timeout))
     if status == EXIT_OK:
