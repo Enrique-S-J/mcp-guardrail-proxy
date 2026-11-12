@@ -26,6 +26,7 @@ from anyio.abc import TaskGroup
 from mcp import MCPError, types
 from mcp.server import Server, ServerRequestContext
 from mcp.server.stdio import stdio_server
+from pydantic import ValidationError
 
 from . import __version__
 from .approval import (
@@ -772,6 +773,14 @@ async def run_proxy(
                 raise UpstreamError(f"the upstream did not answer tools/list within {startup_timeout:g}s") from None
             except MCPError as exc:
                 raise UpstreamError(f"the upstream failed tools/list: {exc}") from exc
+            except ValidationError as exc:
+                # The SDK parses the result into its models and raises when it
+                # does not fit. Say which part, in one line.
+                first = exc.errors()[0]
+                where = ".".join(str(part) for part in first["loc"]) or "(top level)"
+                raise UpstreamError(
+                    f"the upstream's tools/list result is not valid MCP ({where}: {first['msg']})"
+                ) from exc
             _require_unique_names(tools)
             proxy = GuardrailProxy(upstream=upstream, tools=tools, policy=policy, audit=audit, redact=redact)
             for line in proxy.describe():

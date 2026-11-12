@@ -304,6 +304,15 @@ def test_an_upstream_that_lists_one_tool_name_twice_exits_3(workspace):
     assert "Traceback" not in result.stderr
 
 
+def test_an_upstream_whose_tool_list_is_not_valid_mcp_exits_3(workspace):
+    """One clear line and a documented status, not a pydantic traceback and status 1."""
+    ws = workspace("default: deny\n")
+    result = _run_proxy(*ws.proxy_argv(upstream=_upstream_listing(ws, {"tools": [{"name": "no_schema"}]})))
+    assert result.returncode == 3
+    assert "error: the upstream's tools/list result is not valid MCP (tools.0.inputSchema: Field required)" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
 def test_the_upstream_dying_while_idle_stops_the_proxy_with_status_4(workspace, raw_peers):
     """Killed between calls, with the client still connected and its stdin still open."""
     ws = workspace("default: deny\n")
