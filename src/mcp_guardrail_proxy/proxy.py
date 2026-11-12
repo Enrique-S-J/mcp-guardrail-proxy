@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence, Union
 
 import anyio
+from anyio.abc import TaskGroup
 from mcp import MCPError, types
 from mcp.server import Server, ServerRequestContext
 from mcp.server.stdio import stdio_server
@@ -151,6 +152,7 @@ class GuardrailProxy:
             )
             FileApprover.prepare_directory(self._file_approver.directory)
         self._pending_elicitations: dict[str, _PendingElicitation] = {}
+        self._tasks: Optional[TaskGroup] = None
         self._in_flight = 0
         self._stop = anyio.Event()
         self._fatal: Optional[tuple[int, str]] = None
@@ -189,12 +191,17 @@ class GuardrailProxy:
     async def serve(self) -> int:
         """Serve the client over stdio until it disconnects or something fatal happens."""
         server = self.build_server()
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(self._watch_upstream)
-            tg.start_soon(self._stop_when_fatal, tg.cancel_scope)
-            async with stdio_server(stdin=_WireInput()) as (read_stream, write_stream):  # type: ignore[arg-type]
-                await server.run(read_stream, write_stream, server.create_initialization_options())
-            tg.cancel_scope.cancel()
+        try:
+            async with anyio.create_task_group() as tg:
+                self._tasks = tg
+                tg.start_soon(self._watch_upstream)
+                tg.start_soon(self._stop_when_fatal, tg.cancel_scope)
+                async with stdio_server(stdin=_WireInput()) as (read_stream, write_stream):  # type: ignore[arg-type]
+                    await server.run(read_stream, write_stream, server.create_initialization_options())
+                tg.cancel_scope.cancel()
+        finally:
+            self._tasks = None
+            self._abandon_elicitations()
         if self._fatal is None:
             return EXIT_OK
         code, message = self._fatal
@@ -415,6 +422,10 @@ class GuardrailProxy:
             started=started,
             expires=started + timeout,
         )
+        # Nothing obliges the client to call again, so the question's timeout
+        # cannot wait for a request to hang it on.
+        assert self._tasks is not None
+        self._tasks.start_soon(self._expire_elicitations_after, timeout)
         return types.InputRequiredResult(
             input_requests={ELICITATION_KEY: types.ElicitRequest(params=elicitation_params(name, redacted))},
             request_state=call_id,
@@ -437,6 +448,32 @@ class GuardrailProxy:
                     upstream_status=NOT_CALLED,
                     latency_ms=(now - pending.started) * 1000,
                 )
+
+    async def _expire_elicitations_after(self, delay: float) -> None:
+        await anyio.sleep(delay)
+        try:
+            self._expire_elicitations()
+        except AuditError as exc:
+            self._fail(EXIT_AUDIT, str(exc))
+
+    def _abandon_elicitations(self) -> None:
+        """On the way out: give every question still open a closing line."""
+        now = time.monotonic()
+        try:
+            for asked_id, pending in list(self._pending_elicitations.items()):
+                del self._pending_elicitations[asked_id]
+                self._audit.record(
+                    call_id=asked_id,
+                    tool=pending.tool,
+                    arguments=pending.redacted_arguments,
+                    decision="cancelled",
+                    rule=pending.rule,
+                    reason="the session ended before the approval prompt was answered",
+                    upstream_status=NOT_CALLED,
+                    latency_ms=(now - pending.started) * 1000,
+                )
+        except AuditError as exc:
+            self._fail(EXIT_AUDIT, str(exc))
 
     # -- outcomes ----------------------------------------------------------
 

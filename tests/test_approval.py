@@ -597,8 +597,8 @@ async def test_an_approval_cannot_be_replayed_moved_or_invented(workspace):
     assert [entry["upstream_status"] for entry in ws.audit() if entry["decision"] == "approved"] == ["pending", "ok"]
 
 
-async def test_an_unanswered_question_over_the_2026_protocol_is_closed_out_as_a_timeout(workspace):
-    """No second call ever arrives, so the timeout is recorded when the proxy next handles a call."""
+async def test_an_unanswered_question_over_the_2026_protocol_times_out_on_its_own(workspace):
+    """Nothing else is ever asked of the proxy. The timeout still has to reach the log, and when it is due."""
     ws = workspace(ELICIT_POLICY.format(timeout=0.3))
 
     async def noop(context, params):
@@ -607,7 +607,14 @@ async def test_an_unanswered_question_over_the_2026_protocol_is_closed_out_as_a_
     async with connect_modern(ws, elicitation_callback=noop) as client:
         question = await client.session.call_tool("send_email", EMAIL, allow_input_required=True)
         assert isinstance(question, types.InputRequiredResult)
-        await anyio.sleep(0.4)
+        # No further request of any kind: the line has to appear while the client just sits there.
+        await wait_for(lambda: len(ws.audit()) == 2, timeout=5)
+        requested, timed_out = ws.audit()
+        assert (requested["decision"], requested["call_id"]) == ("approval_requested", question.request_state)
+        assert (timed_out["decision"], timed_out["call_id"]) == ("timeout", question.request_state)
+        assert timed_out["upstream_status"] == "not_called"
+        assert 300 <= timed_out["latency_ms"] < 3000
+
         late = await client.session.call_tool(
             "send_email",
             EMAIL,
@@ -619,7 +626,24 @@ async def test_an_unanswered_question_over_the_2026_protocol_is_closed_out_as_a_
         assert isinstance(late, types.InputRequiredResult)
 
     assert ws.upstream_calls() == []
-    decisions = [(entry["decision"], entry["call_id"]) for entry in ws.audit()]
-    assert decisions[0] == ("approval_requested", question.request_state)
-    assert decisions[1] == ("timeout", question.request_state)
-    assert decisions[2][0] == "approval_requested"
+    assert [entry["decision"] for entry in ws.audit()][:3] == ["approval_requested", "timeout", "approval_requested"]
+
+
+async def test_a_question_still_open_when_the_client_disconnects_is_closed_out(workspace):
+    """Asked, never answered, and the session ends well before the timeout. The log must not end on the question."""
+    ws = workspace(ELICIT_POLICY.format(timeout=STEP_TIMEOUT))
+
+    async def noop(context, params):
+        raise AssertionError("not used")
+
+    async with connect_modern(ws, elicitation_callback=noop) as client:
+        question = await client.session.call_tool("send_email", EMAIL, allow_input_required=True)
+        assert isinstance(question, types.InputRequiredResult)
+
+    requested, closed = ws.audit()
+    assert (requested["decision"], requested["call_id"]) == ("approval_requested", question.request_state)
+    assert (closed["decision"], closed["call_id"]) == ("cancelled", question.request_state)
+    assert closed["upstream_status"] == "not_called"
+    assert closed["reason"] == "the session ended before the approval prompt was answered"
+    assert "nested-secret" not in ws.audit_path.read_text()
+    assert ws.upstream_calls() == []
