@@ -9,6 +9,7 @@ start, 4 upstream went away mid-session, 5 audit log could not be written.
 """
 
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -189,9 +190,12 @@ def test_an_unusable_approvals_directory_stops_the_proxy_at_startup(workspace):
 
 def test_an_upstream_command_that_does_not_exist_exits_3(workspace):
     ws = workspace("default: deny\n")
-    result = _run_proxy(*ws.proxy_argv(upstream=[str(ws.dir / "no such program")]))
+    missing = str(ws.dir / "no such program")
+    result = _run_proxy(*ws.proxy_argv(upstream=[missing, "--flag"]))
     assert result.returncode == 3
     assert "could not start the upstream command" in result.stderr
+    # Echoed with its quoting, so a path with spaces still reads as one word.
+    assert f"({shlex.quote(missing)} --flag)" in result.stderr
 
 
 def test_an_upstream_that_exits_during_startup_exits_3(workspace):
