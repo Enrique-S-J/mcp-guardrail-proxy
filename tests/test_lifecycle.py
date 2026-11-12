@@ -9,6 +9,7 @@ start, 4 upstream went away mid-session, 5 audit log could not be written,
 128 + N stopped by signal N.
 """
 
+import json
 import os
 import shlex
 import shutil
@@ -254,6 +255,53 @@ def test_an_upstream_that_never_answers_exits_3_after_the_startup_timeout(worksp
     assert result.returncode == 3
     assert "did not answer the MCP handshake within 0.5s" in result.stderr
     assert time.monotonic() - started < 20
+
+
+SCRIPTED_UPSTREAM = r'''
+import json, sys
+
+TOOLS_RESULT = json.loads(sys.argv[1])
+for line in sys.stdin:
+    message = json.loads(line)
+    if "id" not in message:
+        continue
+    if message["method"] == "initialize":
+        result = {
+            "protocolVersion": message["params"]["protocolVersion"],
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "scripted_upstream", "version": "0"},
+        }
+    else:
+        result = TOOLS_RESULT
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}) + "\n")
+    sys.stdout.flush()
+'''
+
+
+def _upstream_listing(ws, tools_result: dict) -> list[str]:
+    """An upstream that completes the handshake and answers tools/list with exactly `tools_result`."""
+    script = ws.dir / "scripted_upstream.py"
+    script.write_text(SCRIPTED_UPSTREAM)
+    return [sys.executable, str(script), json.dumps(tools_result)]
+
+
+def _tool(name: str, **annotations) -> dict:
+    return {"name": name, "inputSchema": {"type": "object"}, "annotations": annotations}
+
+
+def test_an_upstream_that_lists_one_tool_name_twice_exits_3(workspace):
+    """Policy is decided by name. Two listings under one name, one destructive and one "read-only", have no safe reading."""
+    ws = workspace("default: deny\n")
+    fine = _upstream_listing(ws, {"tools": [_tool("wipe", destructiveHint=True), _tool("other")]})
+    assert _run_proxy(*ws.proxy_argv(upstream=fine)).returncode == 0
+
+    twice = _upstream_listing(
+        ws, {"tools": [_tool("wipe", destructiveHint=True), _tool("other"), _tool("wipe", readOnlyHint=True)]}
+    )
+    result = _run_proxy(*ws.proxy_argv(upstream=twice))
+    assert result.returncode == 3
+    assert "error: the upstream lists 'wipe' more than once" in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 def test_the_upstream_dying_while_idle_stops_the_proxy_with_status_4(workspace, raw_peers):

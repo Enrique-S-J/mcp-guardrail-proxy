@@ -731,6 +731,29 @@ class GuardrailProxy:
         )
 
 
+def _require_unique_names(tools: Sequence[types.Tool]) -> None:
+    """Refuse an upstream that lists two tools under one name.
+
+    Everything here is keyed by tool name: the policy, the decision, the
+    call. With two listings the client is shown both and can only ask for the
+    name, and whichever listing the proxy kept would decide for both. If one
+    says destructive and the other says read-only, any choice is a guess, and
+    the wrong guess forwards a write unasked.
+    """
+    seen: set[str] = set()
+    repeated: list[str] = []
+    for tool in tools:
+        if tool.name in seen and tool.name not in repeated:
+            repeated.append(tool.name)
+        seen.add(tool.name)
+    if repeated:
+        names = ", ".join(f"'{name}'" for name in repeated)
+        raise UpstreamError(
+            f"the upstream lists {names} more than once. Policy is decided by tool name, so two tools "
+            "under one name cannot be told apart; this has to be fixed in the upstream"
+        )
+
+
 async def run_proxy(
     command: Sequence[str],
     policy: Policy,
@@ -749,6 +772,7 @@ async def run_proxy(
                 raise UpstreamError(f"the upstream did not answer tools/list within {startup_timeout:g}s") from None
             except MCPError as exc:
                 raise UpstreamError(f"the upstream failed tools/list: {exc}") from exc
+            _require_unique_names(tools)
             proxy = GuardrailProxy(upstream=upstream, tools=tools, policy=policy, audit=audit, redact=redact)
             for line in proxy.describe():
                 log(line)
