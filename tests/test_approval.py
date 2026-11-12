@@ -234,6 +234,36 @@ async def test_losing_the_approvals_directory_blocks_the_call_and_closes_the_rec
     assert "could not be obtained: FileNotFoundError" in ws.stderr()
 
 
+async def test_startup_clears_out_what_a_killed_proxy_left_behind(workspace):
+    """Requests past their expiry and answers to nothing are dead whoever wrote them. Anything else stays."""
+    ws = workspace(FILE_POLICY.format(timeout=STEP_TIMEOUT))
+    ws.approvals_dir.mkdir()
+    expired, unexpired, orphan = "a" * 32, "b" * 32, "c" * 32
+
+    def request(request_id, expires_at):
+        (ws.approvals_dir / f"{request_id}.json").write_text(
+            json.dumps({"id": request_id, "tool": "send_email", "arguments": {}, "expires_at": expires_at})
+        )
+
+    request(expired, "2020-01-01T00:05:00+00:00")
+    (ws.approvals_dir / f"{expired}.approved").write_text("{}")
+    (ws.approvals_dir / f"{orphan}.denied").touch()
+    # Not expired: from here it cannot be told from a request another proxy is waiting on.
+    request(unexpired, "2999-01-01T00:00:00+00:00")
+    (ws.approvals_dir / f"{unexpired}.approved").write_text("{}")
+    (ws.approvals_dir / "notes.txt").write_text("not ours")
+    (ws.approvals_dir / "not-an-id.json").write_text('{"expires_at": "2020-01-01T00:05:00+00:00"}')
+
+    async with connect(ws) as session:
+        assert (await session.call_tool("get_status", {})).is_error is False
+
+    assert sorted(path.name for path in ws.approvals_dir.iterdir()) == sorted(
+        [f"{unexpired}.json", f"{unexpired}.approved", "notes.txt", "not-an-id.json"]
+    )
+    assert "removed 3 stale files from the approvals directory" in ws.stderr()
+    assert ws.upstream_calls() == [{"tool": "get_status", "arguments": {}}]
+
+
 async def test_read_only_tools_do_not_wait_for_approval(workspace):
     ws = workspace(FILE_POLICY.format(timeout=STEP_TIMEOUT))
     async with connect(ws) as session:

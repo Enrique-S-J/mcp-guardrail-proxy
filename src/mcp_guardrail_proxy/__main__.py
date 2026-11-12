@@ -106,9 +106,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if policy.approval.mode == "file":
         try:
             FileApprover.prepare_directory(policy.approval.directory)
+            swept = FileApprover.sweep(policy.approval.directory)
         except OSError as exc:
             log(f"error: cannot use approvals directory '{policy.approval.directory}': {exc.strerror or exc}")
             sys.exit(EXIT_CONFIG)
+        if swept:
+            log(
+                f"removed {swept} stale file{'s' if swept != 1 else ''} from the approvals directory "
+                "(expired requests and answers to nothing, left by an earlier run)"
+            )
 
     try:
         status = anyio.run(lambda: run_proxy(command, policy, audit, redact, startup_timeout=args.startup_timeout))

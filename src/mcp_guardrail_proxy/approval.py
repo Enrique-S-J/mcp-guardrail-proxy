@@ -115,6 +115,42 @@ class FileApprover:
         if not os.access(directory, os.W_OK | os.X_OK):
             raise PermissionError(13, "Permission denied", str(directory))
 
+    @staticmethod
+    def sweep(directory: Path) -> int:
+        """Remove what an earlier run left behind, and return how many files went.
+
+        A proxy that is killed cannot tidy up after itself. Two kinds of file
+        are certainly dead: a request past its expiry, with any answer to it
+        (a live proxy removes its request when the wait ends), and an answer
+        with no request beside it (a waiting proxy's request is on disk for as
+        long as it waits). Neither test depends on who wrote the file, so this
+        is safe when several proxies share one directory. A request that has
+        not expired yet is left alone: from here it looks the same as one a
+        running proxy is waiting on.
+        """
+        now = time.time()
+        dead: list[Path] = []
+        for path in directory.iterdir():
+            if not _ID_RE.fullmatch(path.stem):
+                continue
+            if path.suffix == PENDING_SUFFIX:
+                try:
+                    expiry = _expiry(json.loads(path.read_text(encoding="utf-8")))
+                except (OSError, ValueError):
+                    continue
+                if expiry is not None and expiry < now:
+                    dead += [path, path.with_suffix(APPROVED_SUFFIX), path.with_suffix(DENIED_SUFFIX)]
+            elif path.suffix in (APPROVED_SUFFIX, DENIED_SUFFIX) and not path.with_suffix(PENDING_SUFFIX).exists():
+                dead.append(path)
+        removed = 0
+        for path in dict.fromkeys(dead):
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            removed += 1
+        return removed
+
     def pending_path(self, call_id: str) -> Path:
         return self.directory / f"{call_id}{PENDING_SUFFIX}"
 
