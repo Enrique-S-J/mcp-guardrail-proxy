@@ -18,6 +18,9 @@ dependencies = [
     # constructor-registered handlers, and ClientSession over stdio_client.
     # Developed and tested against 2.3.0.
     "mcp>=2,<3",
+    # Both are already dependencies of mcp. Listed because this package
+    # imports them directly: the SDK's streams and cancellation are anyio's.
+    "anyio>=4.9,<5",
     "pydantic>=2,<3",
     # The policy file is YAML and mcp does not bring a YAML parser with it.
     "pyyaml>=6,<7",
