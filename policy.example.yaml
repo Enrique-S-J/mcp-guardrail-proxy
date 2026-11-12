@@ -37,9 +37,11 @@ approval:
   # elicitation - ask the human through the MCP client. Only as trustworthy
   #               as the client relaying the answer.
   mode: deny
-  # Used by `file`. A relative path is relative to this file.
+  # Used by `file`. A relative path is relative to this file. Whoever can
+  # write to this directory can approve, so keep it out of the agent's reach;
+  # the proxy refuses to start on one that every user can write to.
   directory: approvals
-  # How long a request waits before it is refused. Keep it below your MCP
-  # client's own request timeout, or the client gives up first.
+  # How long a request waits before it is refused, at most 86400. Keep it
+  # below your MCP client's own request timeout, or the client gives up first.
   timeout_seconds: 300
   poll_interval_seconds: 0.5

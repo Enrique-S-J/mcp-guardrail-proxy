@@ -9,7 +9,7 @@ MCP client ──stdio──▶ mcp-guardrail-proxy ──stdio──▶ upstrea
 (Claude Desktop,          │
  an agent, ...)           ├─ policy.yaml   allow / deny / require_approval, per tool
                           ├─ approvals/    held calls, answered by a human
-                          └─ audit.jsonl   one line per decision
+                          └─ audit.jsonl   every decision, and how each forwarded call went
 ```
 
 The client sees the upstream's tools under their own names, with their own descriptions, schemas, and annotations. The only visible difference is that some calls come back refused, with the policy rule that refused them:
@@ -22,7 +22,7 @@ The pattern is a common one for agents with real access: read-only by default, h
 
 ## Quickstart
 
-Requires Python 3.10+ and the `mcp` SDK 2.x (developed and tested against 2.3.0).
+Requires Python 3.10+ and the `mcp` SDK 2.x (developed and tested against 2.3.0). The other runtime dependencies are pydantic and anyio, which the SDK already brings, and PyYAML, which it does not: the policy file is YAML.
 
 ```bash
 git clone https://github.com/Enrique-S-J/mcp-guardrail-proxy.git
@@ -57,8 +57,11 @@ identical (name, description, schema, annotations): True
   - tail_log (readOnlyHint: True)
 
 audit log:
-{"timestamp": "2026-11-12T06:56:46.284+00:00", "call_id": "2b7c726cabe347e2801ee0ed25165842", "tool": "get_host_summary", "arguments": {}, "decision": "allow", "rule": "read_only_passthrough", "reason": null, "approver": null, "upstream_status": "ok", "latency_ms": 506.9}
+{"timestamp": "2026-11-12T16:46:41.443+00:00", "call_id": "2b1e08d69ba242409bcd6c4a053c759d", "tool": "get_host_summary", "arguments": {}, "decision": "allow", "rule": "read_only_passthrough", "reason": null, "approver": null, "upstream_status": "pending", "latency_ms": 0.0}
+{"timestamp": "2026-11-12T16:46:41.951+00:00", "call_id": "2b1e08d69ba242409bcd6c4a053c759d", "tool": "get_host_summary", "arguments": {}, "decision": "allow", "rule": "read_only_passthrough", "reason": null, "approver": null, "upstream_status": "ok", "latency_ms": 508.5}
 ```
+
+One forwarded call, two lines: the first is written before the call is sent, the second when the answer is back. [Audit log](#audit-log) explains why.
 
 What the script runs is this command, with paths filled in:
 
@@ -90,7 +93,7 @@ Add the proxy as the server and give it the real server's command as its argumen
 }
 ```
 
-`--upstream` is one string, split the way a shell would split it, so a path containing spaces needs quotes inside that string. Inside JSON that gets ugly fast. The alternative is to put the upstream command after a bare `--`, one argument per element, with nothing to quote:
+`--upstream` is one string, split the way a shell would split it, so a path containing spaces needs quotes inside that string. (On Windows the string is split by a rule that keeps backslashes, so `C:\tools\python.exe` stays one word; quote any argument with spaces as a whole. The rule is tested, Windows itself is not: see [Verified and pending](#verified-and-pending).) Inside JSON that gets ugly fast. The alternative is to put the upstream command after a bare `--`, one argument per element, with nothing to quote or split:
 
 ```json
 "args": [
@@ -138,8 +141,8 @@ A call to a tool that was not in the upstream's `tools/list` when the proxy star
 | `redact_fields` | list of key names | `[]` | Argument keys whose values are written as `"[REDACTED]"`, at any nesting depth. |
 | `approval.mode` | `deny`, `file`, `elicitation` | `deny` | How `require_approval` gets its answer. See below. |
 | `approval.directory` | path | `approvals` | Where `file` mode keeps requests. Relative paths are relative to the policy file. |
-| `approval.timeout_seconds` | number > 0 | `300` | How long a held call waits before it is refused. |
-| `approval.poll_interval_seconds` | number > 0 | `0.5` | How often `file` mode looks for an answer. |
+| `approval.timeout_seconds` | number > 0, at most 86400 | `300` | How long a held call waits before it is refused. |
+| `approval.poll_interval_seconds` | number > 0, at most 60 | `0.5` | How often `file` mode looks for an answer. |
 
 Without `--policy`, the defaults above apply: read-only tools are forwarded and everything else is refused.
 
@@ -155,14 +158,18 @@ Redaction matches key names ignoring case, `_`, and `-`, so `api_key` also cover
 
 ```console
 $ mcp-guardrail-approve --dir /path/to/approvals --list
-c536458b289847328b792ee5d3671e74  send_email  expires 2026-11-12T06:58:19+00:00
+dbff7f2022cc4694a4d746fbe884b6bd  send_email  expires 2026-11-12T16:47:43+00:00
     arguments: {"to": "ops@example.test", "subject": "Disk alert", "smtp": {"host": "mail.example.test", "password": "[REDACTED]"}}
 
-$ mcp-guardrail-approve --dir /path/to/approvals c536458b
-Approved c536458b289847328b792ee5d3671e74
+$ mcp-guardrail-approve --dir /path/to/approvals --approver operator dbff7f20
+Approved dbff7f2022cc4694a4d746fbe884b6bd
 ```
 
-`--deny` refuses instead, `--reason` and `--approver` are recorded in the audit log (the approver defaults to the OS user), and `--policy policy.yaml` finds the directory from the policy instead of `--dir`. A unique prefix of the id, six characters or more, is enough. The command is a convenience: any process that creates the file approves the call (`touch <id>.approved` works), and a denial wins if both exist. Requests are removed once answered, timed out, or cancelled.
+`--deny` refuses instead, `--reason` and `--approver` are recorded in the audit log (the approver defaults to the OS user), and `--policy policy.yaml` finds the directory from the policy instead of `--dir`. A unique prefix of the id, six characters or more, is enough. The command is a convenience: any process that creates the file approves the call (`touch <id>.approved` works), and a denial wins if both exist.
+
+Requests are removed once answered, timed out, or cancelled, including when the proxy is stopped with Ctrl-C or SIGTERM. A proxy that is killed outright cannot do that, so a request can outlive it. Once such a request is past its `expires_at`, `--list` marks it `EXPIRED`, the command refuses to answer it, and the next proxy to start on that directory deletes it.
+
+Write access to the directory is the authority to approve, so the proxy looks at who has it. It creates the directory with mode 0700. If the directory already exists and every user can write to it, the proxy refuses to start; if a group can, or another user owns it, it starts and says so on stderr.
 
 **`elicitation`**. The proxy asks through the MCP client, using the protocol's own mechanism for a server to request input from the user. Only an explicit accept with `approve: true` forwards the call; decline, cancel, or anything else blocks it. If the client did not declare elicitation support the call is refused and the message says to use `file`. Both forms the SDK speaks are implemented: an `elicitation/create` request on protocol versions up to 2025-11-25, and an `input_required` result that the client answers with a second `tools/call` on 2026-07-28.
 
@@ -170,13 +177,21 @@ Set `timeout_seconds` below your client's own request timeout. If the client giv
 
 ## Audit log
 
-JSONL, appended to the file given by `--audit`. A call that needs no approval produces one line. A call held for approval produces two with the same `call_id`: `approval_requested` when the wait starts, then the outcome. These four lines are from one real session: a read, a denied call, and an approved one.
+JSONL, appended to the file given by `--audit`. How many lines a call produces depends on how far it got:
+
+- A refused call is one line.
+- A forwarded call is two lines with the same `call_id`: one written before the call is sent, with `upstream_status: pending`, and one with how it went.
+- A call held for approval starts with an `approval_requested` line. What follows under the same `call_id` is its outcome: one `denied`, `timeout`, or `cancelled` line, or the two `approved` lines of a forwarded call.
+
+A `pending` line with nothing after it therefore means a call that was sent and whose outcome the proxy never got to record. These six lines are from one real session: a read, a denied call, and a call approved with `mcp-guardrail-approve`.
 
 ```json
-{"timestamp": "2026-11-12T06:57:49.102+00:00", "call_id": "1ccdcfe115fa4cf1b34cfd17eb9ac176", "tool": "get_status", "arguments": {}, "decision": "allow", "rule": "read_only_passthrough", "reason": null, "approver": null, "upstream_status": "ok", "latency_ms": 1.2}
-{"timestamp": "2026-11-12T06:57:49.119+00:00", "call_id": "23af4edb6d5040858775b53a2ab8d955", "tool": "delete_record", "arguments": {"record_id": "r-1001"}, "decision": "deny", "rule": "tools.delete_record: deny", "reason": "Blocked by mcp-guardrail-proxy: policy rule 'tools.delete_record: deny' denies calls to 'delete_record'.", "approver": null, "upstream_status": "not_called", "latency_ms": 0.0}
-{"timestamp": "2026-11-12T06:57:49.120+00:00", "call_id": "c536458b289847328b792ee5d3671e74", "tool": "send_email", "arguments": {"to": "ops@example.test", "subject": "Disk alert", "smtp": {"host": "mail.example.test", "password": "[REDACTED]"}}, "decision": "approval_requested", "rule": "default: require_approval", "reason": null, "approver": null, "upstream_status": "not_called", "latency_ms": 0.0}
-{"timestamp": "2026-11-12T06:57:49.733+00:00", "call_id": "c536458b289847328b792ee5d3671e74", "tool": "send_email", "arguments": {"to": "ops@example.test", "subject": "Disk alert", "smtp": {"host": "mail.example.test", "password": "[REDACTED]"}}, "decision": "approved", "rule": "default: require_approval", "reason": null, "approver": "enrique", "upstream_status": "ok", "latency_ms": 612.4}
+{"timestamp": "2026-11-12T16:47:12.587+00:00", "call_id": "910d8c257fc6430eb5cd33e3b76a0d02", "tool": "get_status", "arguments": {}, "decision": "allow", "rule": "read_only_passthrough", "reason": null, "approver": null, "upstream_status": "pending", "latency_ms": 0.0}
+{"timestamp": "2026-11-12T16:47:12.588+00:00", "call_id": "910d8c257fc6430eb5cd33e3b76a0d02", "tool": "get_status", "arguments": {}, "decision": "allow", "rule": "read_only_passthrough", "reason": null, "approver": null, "upstream_status": "ok", "latency_ms": 1.4}
+{"timestamp": "2026-11-12T16:47:12.612+00:00", "call_id": "73b15e5d082d466c85b20b77c2fee800", "tool": "delete_record", "arguments": {"record_id": "r-1001"}, "decision": "deny", "rule": "tools.delete_record: deny", "reason": "Blocked by mcp-guardrail-proxy: policy rule 'tools.delete_record: deny' denies calls to 'delete_record'.", "approver": null, "upstream_status": "not_called", "latency_ms": 0.0}
+{"timestamp": "2026-11-12T16:47:12.614+00:00", "call_id": "dbff7f2022cc4694a4d746fbe884b6bd", "tool": "send_email", "arguments": {"to": "ops@example.test", "subject": "Disk alert", "smtp": {"host": "mail.example.test", "password": "[REDACTED]"}}, "decision": "approval_requested", "rule": "default: require_approval", "reason": null, "approver": null, "upstream_status": "not_called", "latency_ms": 0.0}
+{"timestamp": "2026-11-12T16:47:13.124+00:00", "call_id": "dbff7f2022cc4694a4d746fbe884b6bd", "tool": "send_email", "arguments": {"to": "ops@example.test", "subject": "Disk alert", "smtp": {"host": "mail.example.test", "password": "[REDACTED]"}}, "decision": "approved", "rule": "default: require_approval", "reason": null, "approver": "operator", "upstream_status": "pending", "latency_ms": 510.9}
+{"timestamp": "2026-11-12T16:47:13.126+00:00", "call_id": "dbff7f2022cc4694a4d746fbe884b6bd", "tool": "send_email", "arguments": {"to": "ops@example.test", "subject": "Disk alert", "smtp": {"host": "mail.example.test", "password": "[REDACTED]"}}, "decision": "approved", "rule": "default: require_approval", "reason": null, "approver": "operator", "upstream_status": "ok", "latency_ms": 512.3}
 ```
 
 | Field | Meaning |
@@ -185,11 +200,11 @@ JSONL, appended to the file given by `--audit`. A call that needs no approval pr
 | `call_id` | Random id for the call. Also the approval request id. |
 | `tool` | Tool name as the client sent it. |
 | `arguments` | The call's arguments, after redaction. |
-| `decision` | `allow`, `deny`, `approval_requested`, `approved`, `denied`, `timeout`, or `cancelled` (the call was withdrawn while approval was pending, by the client or because the proxy was stopping). |
-| `rule` | The policy rule that decided: `tools.<name>: <action>`, `read_only_passthrough`, `default: <action>`, or `unknown_tool`. |
-| `reason` | Free text: the refusal shown to the client, the approver's reason, or a note on an upstream failure. |
+| `decision` | `allow`, `deny`, `approval_requested`, `approved`, `denied`, `timeout`, or `cancelled` (approval was still pending when the client withdrew the call, the session ended, or the proxy began to stop). |
+| `rule` | The policy rule that decided: `tools.<name>: <action>`, `read_only_passthrough`, `default: <action>`, or `unknown_tool`. When a `require_approval` rule ends in a refusal because there was nobody to ask, the cause is appended: `default: require_approval (approval.mode: deny)`, or `... (approval.mode: elicitation, unsupported by client)`. Filter on the prefix. |
+| `reason` | Free text from the proxy or the approver: the refusal shown to the client, the approver's reason, or a note on what went wrong. Never text from the upstream or the client; for a JSON-RPC error it gives the code only. |
 | `approver` | Who answered, if anyone: the name from the decision file, or `elicitation:<client name>`. |
-| `upstream_status` | `ok`, `error` (the tool returned `isError`), `protocol_error` (the upstream answered with a JSON-RPC error), `connection_lost`, `invalid_response`, `cancelled`, or `not_called`. |
+| `upstream_status` | `not_called`; `pending`, on the line written just before the call is sent; then one of `ok`, `error` (the tool returned `isError`), `protocol_error` (the upstream answered with a JSON-RPC error), `connection_lost`, `invalid_response` (the answer was not a tool result), or `cancelled` (the client withdrew the call, or the proxy stopped, after it had been sent). |
 | `latency_ms` | From receiving the call to writing this line. Includes any time spent waiting for approval. |
 
 Each line is a single `write` to a file opened with `O_APPEND`; the proxy never rewrites or truncates the log, and a restart adds to the existing file. The file is created with mode 0600 and reopened for each line, so it can be rotated while the proxy runs. Tool results are not logged.
@@ -200,9 +215,10 @@ Each line is a single `write` to a file opened with `O_APPEND`; the proxy never 
 |--------|---------|
 | 0 | The client disconnected. |
 | 2 | Bad arguments, an invalid policy, or an unusable audit path or approvals directory. Nothing was started. |
-| 3 | The upstream could not be started, exited during startup, or did not answer within `--startup-timeout` (default 30s). |
-| 4 | The upstream exited or closed its connection mid-session. A call in flight gets an `isError` result saying so. |
-| 5 | The audit log could not be written. |
+| 3 | The upstream could not be started, exited during startup, did not answer within `--startup-timeout` (default 30s), or listed tools the proxy cannot work with: a list that is not valid MCP, or the same tool name twice. |
+| 4 | The upstream exited or closed its connection mid-session. A call in flight gets an `isError` result saying so, whether it had been forwarded or was still waiting for approval. |
+| 5 | The audit log could not be written. The call that hit the failure gets an `isError` result saying whether it had already been forwarded. |
+| 130, 143, 129 | Stopped by SIGINT (Ctrl-C), SIGTERM, or SIGHUP: 128 plus the signal number. Calls waiting for approval are answered and recorded as `cancelled`, the upstream is shut down, and then the proxy exits. |
 
 The upstream's stderr is passed through to the proxy's, so its own error output appears just above the proxy's.
 
@@ -211,9 +227,11 @@ The upstream's stderr is passed through to the proxy's, so its own error output 
 - **Trust `readOnlyHint`, deny everything else by default.** The annotation is the one machine-readable statement MCP has about what a tool does, and an author who sets it has thought about the question. Using it means reads flow without a rule or a prompt each, which matters more than it sounds: a guardrail that interrupts every read gets switched off, and one that asks for approval constantly trains people to approve without reading. The trust is deliberately narrow. Only an explicit `true` passes; a tool with no annotations, the common case of an author who never considered it, is treated as a write. And it is revocable: a per-tool rule always wins, and `read_only_passthrough: false` withdraws it altogether.
 - **File approval is the baseline because it needs nothing from the client.** The answer is a file appearing in a directory. It never travels over MCP, so it works with clients that do not implement elicitation, and the thing being gated is not on the path the approval takes. Elicitation is more convenient, but it asks the client to relay the human's answer, and the proxy has to take the client's word for it.
 - **Redaction happens at log time, not call time.** The proxy's job is to decide whether a call goes through and to record that it did, not to rewrite it. A tool that needs a password to do its work has to receive the password; scrubbing the forwarded call would break tools in a way that looks like an upstream bug. So redaction applies to copies on their way to somewhere they will be read later: the audit log, the pending-approval file, and the elicitation prompt. The tests check this against the upstream's own record of what it received.
-- **The tool list is pinned at startup.** Tools are read once and decisions use the annotations captured then. An upstream cannot add a tool mid-session, or relabel one as read-only, and have the proxy go along with it. The cost is that a legitimate change needs a restart, and the refusal says so.
+- **The tool list is pinned at startup.** Tools are read once and decisions use the annotations captured then. An upstream cannot add a tool mid-session, or relabel one as read-only, and have the proxy go along with it. The cost is that a legitimate change needs a restart, and the refusal says so. An upstream that lists the same name twice is refused at startup on the same principle: policy is by name, and two listings under one name, one marked destructive and one marked read-only, have no reading that is not a guess.
 - **A policy that does not parse does not load.** Every way a policy file can mean something other than what was typed is an error: unknown keys, duplicate keys, bad actions. Plain PyYAML keeps the last of two duplicate keys, so a later `send_email: allow` would quietly override an earlier `deny`. Failing closed at startup is cheaper than explaining an incident.
-- **No record, no call.** The proxy checks that it can append to the audit log before forwarding a call. If the log goes away, the call is not forwarded, the client is told why, and the proxy exits with status 5 instead of carrying on unaudited.
+- **A call is on record before it leaves.** A forwarded call's first audit line is written, with `upstream_status: pending`, before anything is sent; a second line records how it went. If the first write fails, the call is not sent, the client is told so, and the proxy exits with status 5 instead of carrying on unaudited. One line written after the upstream answered would be tidier and would be wrong: a proxy that is killed mid-call, or whose disk fills while the upstream is working, can write nothing afterwards, and by then the call cannot be taken back. Checking beforehand that the log can be opened is not enough either, because a full disk still opens files. If it is the second write that fails, the call is already on record as sent, and the client is told it was forwarded and may have taken effect.
+- **The other side's words stay out of the log.** Redaction works on argument keys. What an upstream or a client writes back is free text with no keys to go by, and a validator that quotes the input it rejected would put a redacted password into the log one field along from its `[REDACTED]`. So tool results are not logged, and for a JSON-RPC error, whether from the upstream or from a client answering an approval prompt, the log records the code and not the message. The client still receives the upstream's error unchanged.
+- **A held call always gets a closing line, and an answer if anyone is left to hear it.** Whatever ends the wait (approval, denial, timeout, a failure to ask at all, the upstream dying, a signal to stop, the client withdrawing the call, the session ending with a question open), the log gets a second line for that `call_id`, short of the log itself being what failed. Unless it was the client that walked away, the client gets a result saying what happened and that the call was not forwarded.
 - **Refusals name the rule.** A denied call returns a normal tool result with `isError: true` and the policy rule that fired. The model can tell the user what happened and why, instead of retrying or guessing.
 - **Tools are handed back, not re-declared.** The proxy serves through the SDK's low-level `Server`, whose handlers return protocol objects. The decorator API derives a schema from a Python function signature, which is the wrong tool when the schema already exists and belongs to someone else. Upstream results are passed through unvalidated for the same reason: judging the upstream's output is the client's job.
 - **An approval cannot be reused.** On protocol 2026-07-28 the approval answer arrives as arguments to a second `tools/call`, which hands the client everything it would need to try again. The state the proxy sends is only the random id of an entry it keeps in memory; the entry is bound to the tool and arguments that were shown, expires, and is deleted when used.
@@ -223,14 +241,14 @@ The upstream's stderr is passed through to the proxy's, so its own error output 
 - **Annotations are self-reported.** The proxy cannot verify that a tool marked read-only really is. A careless or hostile upstream can mark a destructive tool `readOnlyHint: true` and it will pass. Pair the proxy with least-privilege credentials on the upstream, so that what a tool can do is bounded by something other than its own description, and use explicit rules or `read_only_passthrough: false` for a server you have no reason to trust.
 - **Policy is by tool name only.** There are no rules on arguments. `run_query` is allowed or it is not; the proxy cannot allow `SELECT` and hold `DELETE`.
 - **Tools only.** Resources, prompts, sampling, progress and log notifications, and tool-list change notifications are not proxied. A client asking for `resources/list` gets "Method not found".
-- **Whoever can write to the approvals directory can approve.** That includes an agent that also has a filesystem or shell tool. Keep the directory somewhere the agent cannot reach. The proxy creates it with mode 0700, which stops other users, not other tools running as you.
+- **Whoever can write to the approvals directory can approve.** That includes an agent that also has a filesystem or shell tool. Keep the directory somewhere the agent cannot reach. The permission check at startup is about other users, and only on POSIX systems; it does nothing about other tools running as you.
 - **Elicitation is only as trustworthy as the client.** A client can answer an approval prompt without showing it to anyone. The `approver` recorded in that mode is the client's name, because that is all the proxy can see.
 - **Redaction is by key name.** A secret inside a free-text value (a password in an email body) is logged as is.
 - **The audit log is append-only by the proxy's behaviour, not by enforcement.** Anything with write access to the file can alter it. For tamper evidence, ship it elsewhere or use the filesystem's append-only flag.
 - **Fields the SDK does not model are dropped.** Tools pass through the SDK's models. Everything the protocol defines survives, and input and output schemas survive whole, vendor keywords included. A non-standard key on the tool object itself, or inside `annotations`, does not. Key order within JSON objects is not preserved.
 - **stdio only, one upstream, one client.** The proxy always uses the `initialize` handshake with the upstream.
-- **A killed proxy does not signal the upstream.** On a normal disconnect the upstream is shut down properly. If the proxy itself is killed, the upstream sees its stdin close, which a well-behaved stdio server treats as the signal to exit.
-- **When the upstream dies mid-call, the proxy cannot say whether the call took effect.** The audit line records `connection_lost`, not an outcome.
+- **A proxy killed outright (SIGKILL, power loss) leaves loose ends.** It cannot write closing lines or tidy up. A forwarded call's record ends at `pending`, a held call's ends at `approval_requested`, and the held call's request file stays in the approvals directory, where `mcp-guardrail-approve` will still take an answer for it until it expires. The upstream is not signalled; it sees its stdin close, which a well-behaved stdio server treats as the signal to exit.
+- **When the upstream dies mid-call, the proxy cannot say whether the call took effect.** The audit line records `connection_lost`, not an outcome. The same goes for a call still at the upstream when the proxy is told to stop by a signal: it is given one second to finish, then recorded as `cancelled`, and the client sees the connection close instead of a result.
 
 ## Testing
 
@@ -239,26 +257,31 @@ pip install -e ".[dev]"
 pytest
 ```
 
-114 tests, all offline. They start real subprocesses, so a run takes about 40 seconds.
+155 tests, all offline. They start real subprocesses, so a run takes a little over a minute.
 
 - **`test_policy.py`** and **`test_audit.py`** test the decision table, policy parsing, the log writer, and redaction directly.
-- **`test_proxy.py`**, **`test_approval.py`**, and **`test_lifecycle.py`** start the proxy as a subprocess in front of `tests/fake_upstream.py` and talk to it over stdio, with an SDK client session or with raw JSON-RPC lines. Nothing in them calls the proxy's functions. `tools/list` and a tool result are compared, as JSON, against what the upstream returns when asked directly. "Blocked" is asserted against the fake upstream's own log of the calls it received, not against the proxy's account of itself.
+- **`test_proxy.py`**, **`test_approval.py`**, and **`test_lifecycle.py`** start the proxy as a subprocess in front of `tests/fake_upstream.py` and talk to it over stdio, with an SDK client session or with raw JSON-RPC lines. `tools/list` and a tool result are compared, as JSON, against what the upstream returns when asked directly. "Blocked" is asserted against the fake upstream's own log of the calls it received, not against the proxy's account of itself. Two tests in these files call a function instead, for cases that could not be staged for real where the suite has run: the Windows rule for splitting `--upstream`, and the warning about an approvals directory owned by another user, which takes root to set up.
 
-Covered over the protocol: tool re-exposure including a paged upstream list, each policy outcome, redaction in the log and not in the forwarded call, file approval (approved, denied, timed out, cancelled, and through `mcp-guardrail-approve`), elicitation at both protocol versions including attempts to replay or move an approval, upstream paths with spaces in both command forms, and each exit status. The upstream-crash tests kill the fake upstream while the client is still connected.
+Covered over the protocol: tool re-exposure including a paged upstream list, each policy outcome, redaction in the log and not in the forwarded call, file approval (approved, denied, timed out, cancelled, a request that cannot be written, and through `mcp-guardrail-approve`), elicitation at both protocol versions including attempts to replay or move an approval and prompts that are never answered, upstream paths with spaces in both command forms, and each exit status. The failure tests do the thing itself: they kill the fake upstream while the client is still connected, send the proxy SIGINT, SIGTERM and SIGHUP, kill it mid-call, and run it through a launcher (`tests/faulty_disk_proxy.py`) that makes writes to files fail with ENOSPC the way a full disk does.
 
-The guards were mutation-checked: 51 deliberate breakages of the source (forwarding a denied call, redacting the forwarded arguments, reading only the first page of tools, accepting duplicate policy keys, and so on), each confirmed to fail a specific test before being reverted.
+The guards are mutation-checked. `scripts/mutation_check.py` holds 84 deliberate breakages of the source (forwarding a denied call, sending the redacted arguments upstream, reading only the first page of tools, accepting duplicate policy keys, leaving SIGTERM to its default action, and so on), each paired with the tests that are meant to notice. It applies them one at a time and expects a failure. Run it after changing the source:
+
+```bash
+python scripts/mutation_check.py     # about six minutes; edits src/ in place and restores it
+```
 
 ### Verified and pending
 
-Verified, on macOS (Apple Silicon) with `mcp` 2.3.0:
+Verified, on macOS (Apple Silicon):
 
-- The test suite on Python 3.13 and 3.15.
+- The test suite on Python 3.13 and 3.15 with `mcp` 2.3.0, and on Python 3.13 with `mcp` 2.0.0, the oldest version the package allows.
+- The mutation check: 84 of 84 caught, on Python 3.15 with `mcp` 2.3.0.
 - The sysops-mcp demo above, with the proxy on `mcp` 2.3.0 and sysops-mcp on `mcp` 2.0.0.
-- Installing from a fresh clone by the quickstart steps and running the tests there.
+- Installing from a fresh clone by the quickstart steps and running the tests there. The clone was of the local repository, made before it was pushed anywhere.
 
 Pending:
 
-- **Linux and Windows.** Not run. A CI workflow for Linux and macOS across Python 3.10 to 3.13 is in the repo but has not run yet. Nothing has been tried on Windows.
+- **Linux and Windows.** Not run. A CI workflow for Linux and macOS across Python 3.10 to 3.13 is in the repo but has not run yet. Nothing has been tried on Windows, where three things also differ by design: only Ctrl-C is handled as a stop signal, the approvals directory's permissions are not checked, and `--upstream` is split by a Windows rule that has been tested as a function only.
 - **Python 3.10 to 3.12.** Declared supported, not yet run.
 - **Claude Desktop and other GUI clients.** The config example passes the same arguments the tests and the demo pass, but has not been loaded into Claude Desktop.
 - **Elicitation against a third-party client.** Tested only with the Python SDK's own client, at both protocol versions.
