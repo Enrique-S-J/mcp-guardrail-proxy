@@ -314,6 +314,8 @@ class GuardrailProxy:
                 outcome = await self._file_approver.request(
                     call_id=call_id, tool=name, arguments=self._redact(arguments)
                 )
+            except Exception as exc:
+                outcome = self._approval_failed(name, call_id, exc)
             except anyio.get_cancelled_exc_class():
                 self._record(
                     call_id,
@@ -384,6 +386,9 @@ class GuardrailProxy:
                 outcome = ApprovalOutcome(
                     "denied", None, f"the client answered the approval prompt with JSON-RPC error {exc.error.code}"
                 )
+            except Exception as exc:
+                # Typically an answer that is not an elicitation result at all.
+                outcome = self._approval_failed(name, call_id, exc)
             except anyio.get_cancelled_exc_class():
                 self._record(
                     call_id,
@@ -476,6 +481,18 @@ class GuardrailProxy:
             self._fail(EXIT_AUDIT, str(exc))
 
     # -- outcomes ----------------------------------------------------------
+
+    def _approval_failed(self, name: str, call_id: str, exc: Exception) -> ApprovalOutcome:
+        """Asking for approval broke. That is a denial with a closing line, not a crashed call.
+
+        Left alone, the exception would end the call as a protocol error
+        carrying its raw text (a local path, for a missing approvals
+        directory) and leave the log at `approval_requested`. The detail goes
+        to stderr for the operator; the client and the log get the kind of
+        failure only.
+        """
+        log(f"approval for '{name}' (request {call_id}) could not be obtained: {type(exc).__name__}: {exc}")
+        return ApprovalOutcome("denied", None, f"approval could not be obtained ({type(exc).__name__})")
 
     async def _conclude(
         self,

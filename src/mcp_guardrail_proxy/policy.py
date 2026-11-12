@@ -41,8 +41,11 @@ class ApprovalConfig(BaseModel):
     # Relative paths are resolved against the policy file's directory, not the
     # working directory: MCP clients launch servers from wherever they like.
     directory: Path = Path("approvals")
-    timeout_seconds: float = Field(default=300.0, gt=0)
-    poll_interval_seconds: float = Field(default=0.5, gt=0)
+    # Bounded above as well as below. An infinite or astronomically large
+    # timeout parses as a float and then fails on first use, when the request's
+    # expiry time is computed, which is after the call has been held.
+    timeout_seconds: float = Field(default=300.0, gt=0, le=86400, allow_inf_nan=False)
+    poll_interval_seconds: float = Field(default=0.5, gt=0, le=60, allow_inf_nan=False)
 
 
 class Policy(BaseModel):

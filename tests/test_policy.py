@@ -86,11 +86,26 @@ def test_empty_policy_is_the_safe_default():
         ("tools:\n  send_email: maybe\n", "tools.send_email"),
         ("approval:\n  mode: slack\n", "approval.mode"),
         ("approval:\n  mode: file\n  timeout_seconds: 0\n", "approval.timeout_seconds"),
+        ("approval:\n  mode: file\n  timeout_seconds: .inf\n", "approval.timeout_seconds"),
+        ("approval:\n  mode: file\n  timeout_seconds: 1.0e+300\n", "approval.timeout_seconds"),
+        ("approval:\n  mode: file\n  poll_interval_seconds: .inf\n", "approval.poll_interval_seconds"),
         ("approval:\n  mode: file\n  timout_seconds: 5\n", "approval.timout_seconds"),
         ("- just\n- a list\n", "top level must be a mapping"),
         ("default: [unclosed\n", "not valid YAML"),
     ],
-    ids=["unknown-key", "bad-action", "bad-tool-action", "bad-mode", "zero-timeout", "nested-typo", "not-a-mapping", "bad-yaml"],
+    ids=[
+        "unknown-key",
+        "bad-action",
+        "bad-tool-action",
+        "bad-mode",
+        "zero-timeout",
+        "infinite-timeout",
+        "absurd-timeout",
+        "infinite-poll-interval",
+        "nested-typo",
+        "not-a-mapping",
+        "bad-yaml",
+    ],
 )
 def test_invalid_policies_are_rejected_and_say_where(text, expected):
     """A typo must stop the proxy, not fall back to a default nobody chose."""

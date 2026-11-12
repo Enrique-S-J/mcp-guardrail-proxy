@@ -8,6 +8,7 @@ in the approvals directory, then answers it, while the tool call is in flight.
 import getpass
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -209,6 +210,27 @@ async def test_the_pending_request_on_disk_is_redacted(workspace):
     }
     assert set(pending) == {"id", "tool", "arguments", "requested_at", "expires_at"}
     assert "nested-secret" not in ws.audit_path.read_text()
+
+
+async def test_losing_the_approvals_directory_blocks_the_call_and_closes_the_record(workspace):
+    """The directory disappears while the proxy runs. The request cannot be written, so nobody can be asked."""
+    ws = workspace(FILE_POLICY.format(timeout=STEP_TIMEOUT))
+    async with connect(ws) as session:
+        shutil.rmtree(ws.approvals_dir)
+        result = await session.call_tool("send_email", EMAIL)
+        # An ordinary refusal, and the next call is still served.
+        assert (await session.call_tool("get_status", {})).is_error is False
+
+    assert result.is_error is True
+    assert "the request was denied: approval could not be obtained (FileNotFoundError)" in _text(result)
+    # What went wrong on this machine is the operator's business, not the model's.
+    assert str(ws.dir) not in _text(result) and "approvals" not in _text(result)
+    assert ws.upstream_calls() == [{"tool": "get_status", "arguments": {}}]
+    requested, denied = ws.audit()[:2]
+    assert (requested["decision"], denied["decision"]) == ("approval_requested", "denied")
+    assert denied["call_id"] == requested["call_id"]
+    assert denied["reason"] == "approval could not be obtained (FileNotFoundError)"
+    assert "could not be obtained: FileNotFoundError" in ws.stderr()
 
 
 async def test_read_only_tools_do_not_wait_for_approval(workspace):
@@ -454,6 +476,29 @@ def test_a_client_that_answers_the_prompt_with_an_error_does_not_get_the_call_th
     # The error's code is recorded; its text, which is the client's, is not.
     assert denied["reason"] == "the client answered the approval prompt with JSON-RPC error -32603"
     assert "nested-secret" not in ws.audit_path.read_text()
+
+
+@pytest.mark.parametrize(
+    "answer", [{"action": "yes"}, {}, {"action": "accept", "content": ["approve"]}], ids=["bad-action", "empty", "list-content"]
+)
+def test_a_malformed_answer_to_the_prompt_blocks_the_call_and_closes_the_record(workspace, raw_peers, answer):
+    """The client replies to elicitation/create with a result that is not an elicitation result."""
+    ws = workspace(ELICIT_POLICY.format(timeout=STEP_TIMEOUT))
+    proxy = raw_peers(RawPeer.proxy(ws))
+    proxy.initialize(capabilities={"elicitation": {}})
+    call = proxy.send_request("tools/call", {"name": "send_email", "arguments": EMAIL})
+    prompt = proxy.read_request("elicitation/create")
+    proxy.send({"jsonrpc": "2.0", "id": prompt["id"], "result": answer})
+    response = proxy.read_response(call)
+
+    # The tools/call itself was valid; it gets a refusal, not a protocol error about someone else's message.
+    assert "error" not in response
+    assert response["result"]["isError"] is True
+    assert "the request was denied: approval could not be obtained" in response["result"]["content"][0]["text"]
+    assert ws.upstream_calls() == []
+    requested, denied = ws.audit()
+    assert (requested["decision"], denied["decision"]) == ("approval_requested", "denied")
+    assert denied["reason"].startswith("approval could not be obtained (")
 
 
 async def test_elicitation_times_out_if_the_client_never_answers(workspace):
