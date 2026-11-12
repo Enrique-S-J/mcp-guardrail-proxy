@@ -48,6 +48,7 @@ EXIT_AUDIT = 5
 _SHUTDOWN_GRACE_SECONDS = 1.0
 
 NOT_CALLED = "not_called"
+_WITHDRAWN = "the call was withdrawn while approval was pending (cancelled by the client, or the proxy was stopping)"
 
 CallResult = Union[types.CallToolResult, types.InputRequiredResult]
 
@@ -302,7 +303,7 @@ class GuardrailProxy:
                     started,
                     decision="cancelled",
                     rule=decision.rule,
-                    reason="the client cancelled the call while approval was pending",
+                    reason=_WITHDRAWN,
                 )
                 raise
             return await self._conclude(call_id, name, arguments, started, decision.rule, outcome)
@@ -368,7 +369,7 @@ class GuardrailProxy:
                     started,
                     decision="cancelled",
                     rule=rule,
-                    reason="the client cancelled the call while approval was pending",
+                    reason=_WITHDRAWN,
                 )
                 raise
             return await self._conclude(call_id, name, arguments, started, rule, outcome)
@@ -531,7 +532,7 @@ class GuardrailProxy:
             record("protocol_error", f"upstream error {exc.error.code}: {exc.error.message}")
             raise
         except anyio.get_cancelled_exc_class():
-            record("cancelled", "the client cancelled the call after it was forwarded; its effect is unknown")
+            record("cancelled", "the call was cancelled after it was forwarded; its effect is unknown")
             raise
         except Exception as exc:
             record("invalid_response", f"{type(exc).__name__}: the upstream's answer was not a valid tool result")
