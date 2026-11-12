@@ -8,6 +8,7 @@ in the approvals directory, then answers it, while the tool call is in flight.
 import getpass
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -80,11 +81,19 @@ async def _call_and_answer(session, ws, answer, name="send_email", arguments=EMA
 async def test_file_approval_approved_forwards_the_call(workspace):
     ws = workspace(FILE_POLICY.format(timeout=STEP_TIMEOUT))
 
+    modes = {}
+
     def approve(pending):
+        modes["directory"] = stat.S_IMODE(ws.approvals_dir.stat().st_mode)
+        modes["request"] = stat.S_IMODE((ws.approvals_dir / f"{pending['id']}.json").stat().st_mode)
         (ws.approvals_dir / f"{pending['id']}.approved").write_text(json.dumps({"approver": "test-operator"}))
 
     async with connect(ws) as session:
         result, pending = await _call_and_answer(session, ws, approve)
+
+    if os.name != "nt":
+        # Private to the user running the proxy.
+        assert modes == {"directory": 0o700, "request": 0o600}
 
     assert result.is_error is False
     assert _text(result).startswith("sent: ")
@@ -413,6 +422,26 @@ async def test_elicitation_times_out_if_the_client_never_answers(workspace):
     assert "none arrived within 0.4s" in _text(result)
     assert ws.upstream_calls() == []
     assert [entry["decision"] for entry in ws.audit()] == ["approval_requested", "timeout"]
+
+
+async def test_cancelling_a_call_during_elicitation_is_recorded(workspace):
+    ws = workspace(ELICIT_POLICY.format(timeout=STEP_TIMEOUT))
+    asked = anyio.Event()
+
+    async def slow(context, params):
+        asked.set()
+        await anyio.sleep(STEP_TIMEOUT)
+        return types.ElicitResult(action="accept", content={"approve": True})
+
+    async with connect(ws, elicitation_callback=slow) as session:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(session.call_tool, "send_email", EMAIL)
+            await asked.wait()
+            tg.cancel_scope.cancel()
+        await wait_for(lambda: len(ws.audit()) == 2)
+
+    assert [entry["decision"] for entry in ws.audit()] == ["approval_requested", "cancelled"]
+    assert ws.upstream_calls() == []
 
 
 # ---------------------------------------------------------------------------

@@ -88,6 +88,54 @@ def test_tools_are_re_exposed_exactly_as_the_upstream_lists_them(workspace, raw_
     assert nested["items"]["properties"]["api_key"] == {"type": "string"}
 
 
+RAW_UPSTREAM = r'''
+import json, sys
+
+TOOL = {
+    "name": "odd",
+    "description": "A tool carrying keys the MCP SDK has no field for.",
+    "inputSchema": {"type": "object", "x-inside-schema": 1},
+    "annotations": {"readOnlyHint": True, "x-inside-annotations": 2},
+    "x-top-level": 3,
+}
+for line in sys.stdin:
+    message = json.loads(line)
+    if "id" not in message:
+        continue
+    if message["method"] == "initialize":
+        result = {
+            "protocolVersion": message["params"]["protocolVersion"],
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "raw_upstream", "version": "0"},
+        }
+    else:
+        result = {"tools": [TOOL]}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}) + "\n")
+    sys.stdout.flush()
+'''
+
+
+def test_what_survives_when_the_upstream_sends_keys_the_sdk_does_not_model(workspace, raw_peers):
+    """Pins a documented limit, so the README cannot drift from the behaviour.
+
+    Tools pass through the SDK's models on the way in and out. A schema is an
+    open dict and survives whole; a key the models have no field for, on the
+    tool itself or inside its annotations, does not.
+    """
+    ws = workspace(ALLOW_NOTHING_BUT_READS)
+    script = ws.dir / "raw_upstream.py"
+    script.write_text(RAW_UPSTREAM)
+    proxied = raw_peers(RawPeer.proxy(ws, upstream=[sys.executable, str(script)]))
+    proxied.initialize()
+    (tool,), _ = proxied.list_all_tools()
+    assert tool == {
+        "name": "odd",
+        "description": "A tool carrying keys the MCP SDK has no field for.",
+        "inputSchema": {"type": "object", "x-inside-schema": 1},
+        "annotations": {"readOnlyHint": True},
+    }
+
+
 async def test_tools_are_the_same_at_both_protocol_versions(workspace):
     """A 2026-07-28 client sees the same tools as one using the initialize handshake."""
     ws = workspace(ALLOW_NOTHING_BUT_READS)
@@ -143,6 +191,28 @@ def test_a_read_only_call_returns_the_upstream_result_unchanged(workspace, raw_p
     assert entry["approver"] is None
     assert entry["latency_ms"] >= 0
     assert ws.upstream_calls() == [{"tool": "get_status", "arguments": {"verbose": True}}]
+
+
+def test_a_result_that_breaks_the_upstreams_own_output_schema_is_still_passed_on(workspace, raw_peers):
+    """Whether the upstream's output is acceptable is for the client to decide, as it would without a proxy.
+
+    The SDK's ClientSession.call_tool validates results against the tool's
+    output schema and raises; a proxy built on it would turn this result into
+    an error of its own.
+    """
+    ws = workspace(ALLOW_NOTHING_BUT_READS)
+    direct = raw_peers(RawPeer([sys.executable, str(FAKE_UPSTREAM)], ws.stderr_path))
+    direct.initialize()
+    proxied = raw_peers(RawPeer.proxy(ws))
+    proxied.initialize()
+    call = {"name": "get_status", "arguments": {"format": "long"}}
+
+    from_upstream = direct.request("tools/call", call)["result"]
+    through_proxy = proxied.request("tools/call", call)["result"]
+
+    assert from_upstream["structuredContent"] == {"status": "ok"}  # "marker" is required by the schema
+    assert through_proxy == from_upstream
+    assert ws.audit()[0]["upstream_status"] == "ok"
 
 
 async def test_an_upstream_tool_error_is_passed_through_as_is(workspace):
@@ -355,3 +425,17 @@ async def test_one_valid_json_line_per_call_appended_in_order(workspace):
         await session.call_tool("get_status", {})
     assert ws.audit_path.read_bytes().startswith(after_two)
     assert len(ws.audit()) == 3
+
+
+async def test_the_log_can_be_rotated_while_the_proxy_runs(workspace):
+    """Move the file away mid-session; the next record starts a new file at the same path."""
+    ws = workspace(ALLOW_NOTHING_BUT_READS)
+    rotated = ws.dir / "audit.jsonl.1"
+    async with connect(ws) as session:
+        await session.call_tool("get_status", {"verbose": True})
+        ws.audit_path.rename(rotated)
+        await session.call_tool("get_status", {"verbose": False})
+
+    assert rotated.read_text().count("\n") == 1
+    (entry,) = ws.audit()
+    assert entry["arguments"] == {"verbose": False}

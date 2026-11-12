@@ -13,7 +13,9 @@ writes its pid to PATH at startup so a test can kill it.
 Tools listed (across two pages, so a client that stops at the first page
 sees only half of them):
 
-    get_status      read-only; also reports $FAKE_UPSTREAM_MARKER as seen here
+    get_status      read-only; also reports $FAKE_UPSTREAM_MARKER as seen here.
+                    With format="long" its structured result omits a field its
+                    own output schema requires.
     send_email      write; echoes its arguments back
     delete_record   write, destructive; a JSON-RPC error if record_id is missing
     slow_write      write; sleeps for `seconds` before answering
@@ -137,6 +139,8 @@ async def call_tool(ctx: Any, params: types.CallToolRequestParams) -> types.Call
 
     if params.name == "get_status":
         status = {"status": "ok", "marker": os.environ.get("FAKE_UPSTREAM_MARKER")}
+        if arguments.get("format") == "long":
+            del status["marker"]
         return _text(
             json.dumps(status),
             structured_content=status,
