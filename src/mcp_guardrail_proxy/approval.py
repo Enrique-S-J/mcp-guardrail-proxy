@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import math
 import os
 import re
 import sys
@@ -57,6 +58,14 @@ class ApprovalOutcome:
 
 def _utc(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat(timespec="seconds")
+
+
+def _expiry(body: Any) -> Optional[float]:
+    """When a pending request stops being waited on, as epoch seconds, if it says."""
+    try:
+        return datetime.fromisoformat(body["expires_at"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _write_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -126,7 +135,10 @@ class FileApprover:
                 "tool": tool,
                 "arguments": arguments,
                 "requested_at": _utc(now),
-                "expires_at": _utc(now + self.timeout_seconds),
+                # Rounded up to the second it is written in. The approve
+                # command refuses a request once this has passed, so it may
+                # err late but must never be earlier than the real deadline.
+                "expires_at": _utc(math.ceil(now + self.timeout_seconds)),
             },
         )
         try:
@@ -225,12 +237,20 @@ def _list_pending(directory: Path) -> int:
     if not pending:
         print(f"No pending approval requests in {directory}")
         return 0
+    now = time.time()
     for path in pending:
         try:
             body = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        print(f"{body.get('id', path.stem)}  {body.get('tool', '?')}  expires {body.get('expires_at', '?')}")
+        if not isinstance(body, dict):
+            continue
+        expiry = _expiry(body)
+        if expiry is not None and expiry < now:
+            when = f"EXPIRED {body['expires_at']} (left behind by a proxy that is no longer waiting)"
+        else:
+            when = f"expires {body.get('expires_at', '?')}"
+        print(f"{body.get('id', path.stem)}  {body.get('tool', '?')}  {when}")
         print(f"    arguments: {json.dumps(body.get('arguments'), ensure_ascii=True)}")
     return 0
 
@@ -291,6 +311,20 @@ def approve_main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     call_id = matches[0].stem
+    # The proxy removes a request the moment it stops waiting on it. One that
+    # is still here past its expiry was left by a proxy that was killed, and
+    # answering it would report a decision on a call nobody is holding.
+    try:
+        expiry = _expiry(json.loads(matches[0].read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        expiry = None
+    if expiry is not None and expiry < time.time():
+        print(
+            f"Error: request {call_id} expired at {_utc(expiry)}. The proxy that asked is no longer "
+            "waiting, so there is nothing to answer; the call was not forwarded.",
+            file=sys.stderr,
+        )
+        return 1
     suffix = DENIED_SUFFIX if args.deny else APPROVED_SUFFIX
     target = (directory / f"{call_id}{suffix}").resolve()
     if target.parent != directory:

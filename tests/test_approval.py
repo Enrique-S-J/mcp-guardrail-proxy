@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import anyio
@@ -350,6 +351,55 @@ def test_the_approve_command_reports_unknown_and_ambiguous_ids(tmp_path):
     assert sorted(p.name for p in approvals.iterdir() if not p.name.endswith(".json")) == [
         "abcdef" + "0" * 26 + ".approved"
     ]
+
+
+def test_the_approve_command_refuses_a_request_that_has_expired(tmp_path):
+    """A request file that outlived its proxy (killed, crashed) has nobody waiting on it.
+
+    Writing an approval for it and printing "Approved" would tell the operator
+    a call went through when nothing was forwarded.
+    """
+    approvals = tmp_path / "approvals"
+    approvals.mkdir()
+    stale, live = "a" * 32, "b" * 32
+    for request_id, expires_at in ((stale, "2020-01-01T00:05:00+00:00"), (live, "2999-01-01T00:00:00+00:00")):
+        (approvals / f"{request_id}.json").write_text(
+            json.dumps({"id": request_id, "tool": "send_email", "arguments": {}, "expires_at": expires_at})
+        )
+
+    listed = _run_approve("--dir", str(approvals), "--list")
+    assert listed.returncode == 0
+    stale_line, live_line = (line for line in listed.stdout.splitlines() if line.startswith(("a", "b")))
+    assert "EXPIRED 2020-01-01T00:05:00+00:00" in stale_line
+    assert "expires 2999-01-01T00:00:00+00:00" in live_line and "EXPIRED" not in live_line
+
+    for extra in ([], ["--deny"]):
+        refused = _run_approve("--dir", str(approvals), *extra, stale)
+        assert refused.returncode == 1
+        assert f"request {stale} expired at 2020-01-01T00:05:00+00:00" in refused.stderr
+        assert "Approved" not in refused.stdout and "Denied" not in refused.stdout
+    assert sorted(path.name for path in approvals.iterdir()) == [f"{stale}.json", f"{live}.json"]
+
+    # The check is on the date, not on the request having one.
+    assert _run_approve("--dir", str(approvals), live).returncode == 0
+    assert (approvals / f"{live}.approved").exists()
+
+
+async def test_a_pending_request_never_claims_to_expire_before_the_proxy_stops_waiting(workspace):
+    """`expires_at` is what the approve command trusts, so it must not run ahead of the real deadline."""
+    ws = workspace(FILE_POLICY.format(timeout=1.5))
+    async with connect(ws) as session:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(session.call_tool, "send_email", EMAIL)
+            (path,) = await wait_for(lambda: list(ws.approvals_dir.glob("*.json")))
+            pending = json.loads(path.read_text())
+            requested_at = ws.audit()[0]["timestamp"]
+            tg.cancel_scope.cancel()
+
+    waited_from = datetime.fromisoformat(requested_at)
+    expires_at = datetime.fromisoformat(pending["expires_at"])
+    assert expires_at >= waited_from + timedelta(seconds=1.5)
+    assert expires_at < waited_from + timedelta(seconds=1.5 + 2)
 
 
 def test_the_approve_command_works_through_a_symlinked_directory(tmp_path):
