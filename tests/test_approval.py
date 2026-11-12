@@ -99,15 +99,17 @@ async def test_file_approval_approved_forwards_the_call(workspace):
     assert _text(result).startswith("sent: ")
     assert ws.upstream_calls() == [{"tool": "send_email", "arguments": EMAIL}]
 
-    requested, approved = ws.audit()
+    requested, sent, approved = ws.audit()
     assert requested["decision"] == "approval_requested"
     assert requested["upstream_status"] == "not_called"
+    # The approval is on record before the call leaves, and again with its outcome.
+    assert (sent["decision"], sent["approver"], sent["upstream_status"]) == ("approved", "test-operator", "pending")
     assert approved["decision"] == "approved"
     assert approved["approver"] == "test-operator"
     assert approved["upstream_status"] == "ok"
     assert approved["rule"] == "default: require_approval"
-    # One id ties the request file, both audit lines, and the call together.
-    assert requested["call_id"] == approved["call_id"] == pending["id"]
+    # One id ties the request file, the audit lines, and the call together.
+    assert requested["call_id"] == sent["call_id"] == approved["call_id"] == pending["id"]
     # The request and the answer are cleaned up once used.
     assert list(ws.approvals_dir.iterdir()) == []
 
@@ -214,7 +216,10 @@ async def test_read_only_tools_do_not_wait_for_approval(workspace):
     async with connect(ws) as session:
         result = await session.call_tool("get_status", {})
     assert result.is_error is False
-    assert [entry["decision"] for entry in ws.audit()] == ["allow"]
+    assert [(entry["decision"], entry["upstream_status"]) for entry in ws.audit()] == [
+        ("allow", "pending"),
+        ("allow", "ok"),
+    ]
 
 
 async def test_cancelling_a_call_that_is_awaiting_approval_is_recorded(workspace):
@@ -368,10 +373,11 @@ async def test_elicitation_accepted_forwards_the_call(workspace):
     assert "[REDACTED]" in question.message and "nested-secret" not in question.message
     assert question.requested_schema["properties"]["approve"]["type"] == "boolean"
 
-    requested, approved = ws.audit()
+    requested, sent, approved = ws.audit()
     assert requested["decision"] == "approval_requested"
+    assert (sent["decision"], sent["upstream_status"]) == ("approved", "pending")
     assert approved["decision"] == "approved"
-    assert approved["call_id"] == requested["call_id"]
+    assert approved["call_id"] == sent["call_id"] == requested["call_id"]
     # The client that relayed the answer; the proxy cannot see past it.
     assert approved["approver"] == "elicitation:mcp"
     assert approved["upstream_status"] == "ok"
@@ -460,10 +466,13 @@ async def test_elicitation_over_the_2026_protocol_forwards_an_approved_call(work
     assert result.is_error is False
     assert len(asked) == 1
     assert ws.upstream_calls() == [{"tool": "send_email", "arguments": EMAIL}]
-    requested, approved = ws.audit()
-    assert (requested["decision"], approved["decision"]) == ("approval_requested", "approved")
-    assert approved["call_id"] == requested["call_id"]
-    assert approved["upstream_status"] == "ok"
+    requested, sent, approved = ws.audit()
+    assert [(entry["decision"], entry["upstream_status"]) for entry in (requested, sent, approved)] == [
+        ("approval_requested", "not_called"),
+        ("approved", "pending"),
+        ("approved", "ok"),
+    ]
+    assert approved["call_id"] == sent["call_id"] == requested["call_id"]
 
 
 async def test_elicitation_over_the_2026_protocol_blocks_a_declined_call(workspace):
@@ -519,7 +528,8 @@ async def test_an_approval_cannot_be_replayed_moved_or_invented(workspace):
         assert isinstance(replayed, types.InputRequiredResult)
         assert ws.upstream_calls() == [{"tool": "send_email", "arguments": EMAIL}]
 
-    assert [entry["decision"] for entry in ws.audit()].count("approved") == 1
+    # One approval, one forwarded call: the line before it left and the line with its outcome.
+    assert [entry["upstream_status"] for entry in ws.audit() if entry["decision"] == "approved"] == ["pending", "ok"]
 
 
 async def test_an_unanswered_question_over_the_2026_protocol_is_closed_out_as_a_timeout(workspace):

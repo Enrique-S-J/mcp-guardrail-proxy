@@ -12,6 +12,7 @@ The fixtures built on these live in conftest.py.
 from __future__ import annotations
 
 import json
+import os
 import queue
 import shlex
 import subprocess
@@ -111,16 +112,31 @@ async def connect_modern(ws: Workspace, *, elicitation_callback: Any = None):
 class RawPeer:
     """Speaks newline-delimited JSON-RPC to a subprocess, by hand."""
 
-    def __init__(self, argv: list[str], stderr_path: Path) -> None:
+    def __init__(self, argv: list[str], stderr_path: Path, env: Optional[dict[str, str]] = None) -> None:
         self._stderr = open(stderr_path, "a")
-        self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr)
+        self.proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self._stderr,
+            env={**os.environ, **env} if env else None,
+        )
         self._lines: "queue.Queue[Optional[bytes]]" = queue.Queue()
         self._next_id = 0
         threading.Thread(target=self._pump, daemon=True).start()
 
     @classmethod
-    def proxy(cls, ws: Workspace, **argv_options: Any) -> "RawPeer":
-        return cls([sys.executable, "-m", "mcp_guardrail_proxy", *ws.proxy_argv(**argv_options)], ws.stderr_path)
+    def proxy(
+        cls,
+        ws: Workspace,
+        *,
+        launcher: Optional[Path] = None,
+        env: Optional[dict[str, str]] = None,
+        **argv_options: Any,
+    ) -> "RawPeer":
+        """The proxy as `python -m mcp_guardrail_proxy`, or through a `launcher` script that wraps it."""
+        entry = [str(launcher)] if launcher is not None else ["-m", "mcp_guardrail_proxy"]
+        return cls([sys.executable, *entry, *ws.proxy_argv(**argv_options)], ws.stderr_path, env)
 
     def _pump(self) -> None:
         assert self.proc.stdout is not None

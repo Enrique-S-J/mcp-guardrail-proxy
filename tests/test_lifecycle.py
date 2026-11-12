@@ -21,6 +21,8 @@ import pytest
 
 from harness import FAKE_UPSTREAM, STEP_TIMEOUT, RawPeer
 
+FAULTY_DISK_PROXY = Path(__file__).resolve().parent / "faulty_disk_proxy.py"
+
 KILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
@@ -93,7 +95,10 @@ def test_upstream_paths_with_spaces_work(workspace, raw_peers, tmp_path, separat
     assert result["isError"] is False
 
     assert ws.upstream_calls() == [{"tool": "get_status", "arguments": {}}]
-    assert [entry["decision"] for entry in ws.audit()] == ["allow"]
+    assert [(entry["decision"], entry["upstream_status"]) for entry in ws.audit()] == [
+        ("allow", "pending"),
+        ("allow", "ok"),
+    ]
     assert proxy.close() == 0
 
 
@@ -250,8 +255,10 @@ def test_the_upstream_dying_mid_call_fails_that_call_clearly(workspace, raw_peer
     assert "whether the call took effect is unknown" in text
     assert proxy.wait() == 4
 
-    (entry,) = ws.audit()
-    assert (entry["decision"], entry["upstream_status"]) == ("allow", "connection_lost")
+    sent, lost = ws.audit()
+    assert (sent["decision"], sent["upstream_status"]) == ("allow", "pending")
+    assert (lost["decision"], lost["upstream_status"]) == ("allow", "connection_lost")
+    assert lost["call_id"] == sent["call_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +272,7 @@ def test_losing_the_audit_log_stops_forwarding_and_exits_5(workspace, raw_peers)
     proxy = raw_peers(RawPeer.proxy(ws))
     proxy.initialize()
     assert proxy.request("tools/call", {"name": "get_status", "arguments": {}})["result"]["isError"] is False
-    assert len(ws.audit()) == 1
+    assert len(ws.audit()) == 2
 
     # Put a directory where the log file was. Appending now fails on any platform.
     ws.audit_path.rename(ws.dir / "audit-moved-away.jsonl")
@@ -277,3 +284,74 @@ def test_losing_the_audit_log_stops_forwarding_and_exits_5(workspace, raw_peers)
     assert proxy.wait() == 5
     assert "cannot write audit log" in ws.stderr()
     assert [call["tool"] for call in ws.upstream_calls()] == ["get_status"]
+
+
+def _proxy_on_a_disk_that_can_fill(ws, raw_peers):
+    """The proxy plus a switch: `fill()` makes every later write to a file fail with ENOSPC."""
+    flag = ws.dir / "disk-is-full"
+    proxy = raw_peers(RawPeer.proxy(ws, launcher=FAULTY_DISK_PROXY, env={"FAULTY_DISK_FLAG": str(flag)}))
+    return proxy, flag.touch
+
+
+def test_a_full_disk_stops_a_call_before_it_is_forwarded(workspace, raw_peers):
+    """The log still opens on a full disk; only the write fails.
+
+    So the guard has to be a real record written before the call leaves, not
+    a check that the file can be opened.
+    """
+    ws = workspace("default: allow\n")
+    proxy, fill_disk = _proxy_on_a_disk_that_can_fill(ws, raw_peers)
+    proxy.initialize()
+    assert proxy.request("tools/call", {"name": "get_status", "arguments": {}})["result"]["isError"] is False
+    logged_before = ws.audit_path.read_bytes()
+
+    fill_disk()
+
+    result = proxy.request("tools/call", {"name": "delete_record", "arguments": {"record_id": "r-1"}})["result"]
+    assert result["isError"] is True
+    # By the upstream's own account, the delete never arrived.
+    assert [call["tool"] for call in ws.upstream_calls()] == ["get_status"]
+    text = result["content"][0]["text"]
+    assert "could not write its audit log and is shutting down" in text
+    assert "The call was not forwarded" in text
+    assert proxy.wait() == 5
+    assert "No space left on device" in ws.stderr()
+    assert ws.audit_path.read_bytes() == logged_before
+
+
+def test_a_log_failure_after_forwarding_says_the_call_may_have_taken_effect(workspace, raw_peers):
+    """The disk fills while a write is at the upstream. The call is on record as sent, and the client is not told it was stopped."""
+    ws = workspace("default: allow\n")
+    proxy, fill_disk = _proxy_on_a_disk_that_can_fill(ws, raw_peers)
+    proxy.initialize()
+    request_id = proxy.send_request("tools/call", {"name": "slow_write", "arguments": {"seconds": 1}})
+    _wait_until(lambda: ws.upstream_calls() == [{"tool": "slow_write", "arguments": {"seconds": 1}}])
+
+    fill_disk()
+
+    result = proxy.read_response(request_id)["result"]
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert "'slow_write' was forwarded to the upstream" in text
+    assert "may have taken effect" in text
+    assert "not forwarded" not in text
+    assert proxy.wait() == 5
+
+    (sent,) = ws.audit()
+    assert (sent["tool"], sent["decision"], sent["upstream_status"]) == ("slow_write", "allow", "pending")
+
+
+def test_a_call_in_flight_when_the_proxy_is_killed_is_already_on_record(workspace, raw_peers):
+    """A proxy that dies mid-call cannot write anything afterwards, so the record has to exist before."""
+    ws = workspace("default: allow\n")
+    proxy = raw_peers(RawPeer.proxy(ws))
+    proxy.initialize()
+    proxy.send_request("tools/call", {"name": "slow_write", "arguments": {"seconds": 60}})
+    _wait_until(lambda: ws.upstream_calls() == [{"tool": "slow_write", "arguments": {"seconds": 60}}])
+
+    proxy.proc.send_signal(KILL)
+    proxy.proc.wait(timeout=STEP_TIMEOUT)
+
+    (sent,) = ws.audit()
+    assert (sent["tool"], sent["decision"], sent["upstream_status"]) == ("slow_write", "allow", "pending")
+    assert sent["arguments"] == {"seconds": 60}

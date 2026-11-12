@@ -15,9 +15,9 @@ from typing import Any, Callable, Iterable, Optional
 
 REDACTED = "[REDACTED]"
 
-# Decisions a line can carry. A call that needs no approval produces one line
-# (allow or deny). A call that waits for approval produces two that share a
-# call_id: approval_requested when the wait begins, then its outcome.
+# Decisions a line can carry. A refused call produces one line. A forwarded
+# call produces two that share a call_id: one before it is sent, one with how
+# it went. A call that waits for approval has approval_requested before either.
 DECISIONS = frozenset(
     {"allow", "deny", "approval_requested", "approved", "denied", "timeout", "cancelled"}
 )
@@ -78,10 +78,11 @@ class AuditLog:
         self._redact = redact or _no_redaction
 
     def ensure_writable(self) -> None:
-        """Create the file if needed and confirm it can be appended to.
+        """Create the file if needed and confirm it can be opened for appending.
 
         Called once at startup so that a bad path stops the proxy before it
-        accepts a call, not after it has forwarded one.
+        accepts a call. It writes nothing, so it cannot notice a full disk;
+        what protects a forwarded call is the record written before it leaves.
         """
         self._append(b"")
 

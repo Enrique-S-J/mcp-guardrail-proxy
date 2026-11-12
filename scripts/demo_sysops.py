@@ -4,7 +4,7 @@ Starts the proxy as a subprocess, with a sysops-mcp checkout as its upstream
 and a policy that denies nothing, then acts as an MCP client over the proxy's
 stdio: initialize, tools/list, and one tools/call (get_host_summary). Prints
 the tool count next to what sysops-mcp lists when asked directly, and the
-audit line the call produced.
+audit lines the call produced.
 
     python scripts/demo_sysops.py                      # expects ../sysops-mcp
     python scripts/demo_sysops.py --sysops-dir /path/to/sysops-mcp
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import shlex
 import sys
@@ -113,7 +114,9 @@ async def main() -> int:
         print("audit log:")
         print(audit.read_text(encoding="utf-8").rstrip())
 
-        ok = proxy_tools == direct_tools and not result.is_error and audit.read_text().count("\n") == 1
+        # One forwarded call: a line written before it was sent, and a line with its outcome.
+        statuses = [json.loads(line)["upstream_status"] for line in audit.read_text(encoding="utf-8").splitlines()]
+        ok = proxy_tools == direct_tools and not result.is_error and statuses == ["pending", "ok"]
         return 0 if ok else 1
 
 

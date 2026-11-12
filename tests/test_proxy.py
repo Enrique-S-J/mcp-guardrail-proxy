@@ -182,14 +182,19 @@ def test_a_read_only_call_returns_the_upstream_result_unchanged(workspace, raw_p
     assert through_proxy["_meta"] == {"example.test/served-by": "fake-upstream"}
     assert through_proxy["isError"] is False
 
-    (entry,) = ws.audit()
+    # A forwarded call is two lines: one written before it leaves, one with how it went.
+    sent, entry = ws.audit()
+    assert sent["upstream_status"] == "pending"
+    assert {key: value for key, value in sent.items() if key not in ("timestamp", "latency_ms", "upstream_status")} == {
+        key: value for key, value in entry.items() if key not in ("timestamp", "latency_ms", "upstream_status")
+    }
     assert entry["tool"] == "get_status"
     assert entry["arguments"] == {"verbose": True}
     assert entry["decision"] == "allow"
     assert entry["rule"] == "read_only_passthrough"
     assert entry["upstream_status"] == "ok"
     assert entry["approver"] is None
-    assert entry["latency_ms"] >= 0
+    assert entry["latency_ms"] >= sent["latency_ms"] >= 0
     assert ws.upstream_calls() == [{"tool": "get_status", "arguments": {"verbose": True}}]
 
 
@@ -212,7 +217,7 @@ def test_a_result_that_breaks_the_upstreams_own_output_schema_is_still_passed_on
 
     assert from_upstream["structuredContent"] == {"status": "ok"}  # "marker" is required by the schema
     assert through_proxy == from_upstream
-    assert ws.audit()[0]["upstream_status"] == "ok"
+    assert ws.audit()[-1]["upstream_status"] == "ok"
 
 
 async def test_an_upstream_tool_error_is_passed_through_as_is(workspace):
@@ -222,7 +227,7 @@ async def test_an_upstream_tool_error_is_passed_through_as_is(workspace):
         result = await session.call_tool("send_email", {"subject": "no recipient"})
     assert result.is_error is True
     assert _text(result) == "Error: 'to' is required."
-    (entry,) = ws.audit()
+    _, entry = ws.audit()
     assert (entry["decision"], entry["upstream_status"]) == ("allow", "error")
 
 
@@ -235,7 +240,7 @@ async def test_an_upstream_protocol_error_reaches_the_client_unchanged(workspace
     assert exc.value.error.code == -32602
     assert exc.value.error.message == "record_id is required"
     assert exc.value.error.data == {"field": "record_id"}
-    (entry,) = ws.audit()
+    _, entry = ws.audit()
     assert (entry["decision"], entry["upstream_status"]) == ("allow", "protocol_error")
     assert "record_id is required" in entry["reason"]
 
@@ -289,7 +294,8 @@ async def test_an_explicit_allow_forwards_a_write_tool(workspace):
     assert _text(result) == 'sent: {"to": "nobody@example.test"}'
     assert blocked.is_error is True
     assert ws.upstream_calls() == [{"tool": "send_email", "arguments": {"to": "nobody@example.test"}}]
-    allowed, denied = ws.audit()
+    sent, allowed, denied = ws.audit()
+    assert (sent["decision"], sent["rule"], sent["upstream_status"]) == ("allow", "tools.send_email: allow", "pending")
     assert (allowed["decision"], allowed["rule"], allowed["upstream_status"]) == (
         "allow",
         "tools.send_email: allow",
@@ -332,6 +338,7 @@ async def test_without_a_policy_file_reads_pass_and_writes_are_refused(workspace
     )
     assert [call["tool"] for call in ws.upstream_calls()] == ["get_status"]
     assert [(e["decision"], e["rule"]) for e in ws.audit()] == [
+        ("allow", "read_only_passthrough"),
         ("allow", "read_only_passthrough"),
         ("deny", "default: require_approval (approval.mode: deny)"),
     ]
@@ -387,8 +394,8 @@ async def test_secrets_are_redacted_in_the_log_but_not_in_the_forwarded_call(wor
 
     raw_log = ws.audit_path.read_text()
     assert "nested-secret" not in raw_log
-    (entry,) = ws.audit()
-    assert entry["arguments"] == {
+    sent, entry = ws.audit()
+    assert sent["arguments"] == entry["arguments"] == {
         "to": "nobody@example.test",
         "smtp": {
             "host": "mail.example.test",
@@ -405,26 +412,28 @@ async def test_blocked_calls_are_redacted_in_the_log_too(workspace):
     assert "nested-secret" not in ws.audit_path.read_text()
 
 
-async def test_one_valid_json_line_per_call_appended_in_order(workspace):
+async def test_every_line_is_valid_json_appended_in_order(workspace):
+    """A refused call is one line. A forwarded call is two that share a call_id."""
     ws = workspace(ALLOW_NOTHING_BUT_READS)
     async with connect(ws) as session:
-        await session.call_tool("get_status", {})
-        after_one = ws.audit_path.read_bytes()
         await session.call_tool("send_email", {"to": "nobody@example.test"})
+        after_one = ws.audit_path.read_bytes()
+        await session.call_tool("get_status", {})
         after_two = ws.audit_path.read_bytes()
 
     assert after_one.count(b"\n") == 1
-    assert after_two.count(b"\n") == 2
+    assert after_two.count(b"\n") == 3
     assert after_two.startswith(after_one)
-    first, second = ws.audit()  # json.loads on every line
-    assert [first["tool"], second["tool"]] == ["get_status", "send_email"]
-    assert first["call_id"] != second["call_id"]
+    refused, sent, answered = ws.audit()  # json.loads on every line
+    assert [refused["tool"], sent["tool"], answered["tool"]] == ["send_email", "get_status", "get_status"]
+    assert [sent["upstream_status"], answered["upstream_status"]] == ["pending", "ok"]
+    assert sent["call_id"] == answered["call_id"] != refused["call_id"]
 
     # A second run of the proxy adds to the same file.
     async with connect(ws) as session:
-        await session.call_tool("get_status", {})
+        await session.call_tool("send_email", {"to": "nobody@example.test"})
     assert ws.audit_path.read_bytes().startswith(after_two)
-    assert len(ws.audit()) == 3
+    assert len(ws.audit()) == 4
 
 
 async def test_the_log_can_be_rotated_while_the_proxy_runs(workspace):
@@ -436,6 +445,6 @@ async def test_the_log_can_be_rotated_while_the_proxy_runs(workspace):
         ws.audit_path.rename(rotated)
         await session.call_tool("get_status", {"verbose": False})
 
-    assert rotated.read_text().count("\n") == 1
-    (entry,) = ws.audit()
-    assert entry["arguments"] == {"verbose": False}
+    assert rotated.read_text().count("\n") == 2
+    sent, entry = ws.audit()
+    assert sent["arguments"] == entry["arguments"] == {"verbose": False}

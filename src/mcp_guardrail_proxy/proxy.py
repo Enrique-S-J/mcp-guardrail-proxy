@@ -48,6 +48,8 @@ EXIT_AUDIT = 5
 _SHUTDOWN_GRACE_SECONDS = 1.0
 
 NOT_CALLED = "not_called"
+# The upstream_status of the line written just before a call is sent.
+PENDING = "pending"
 _WITHDRAWN = "the call was withdrawn while approval was pending (cancelled by the client, or the proxy was stopping)"
 
 CallResult = Union[types.CallToolResult, types.InputRequiredResult]
@@ -81,6 +83,10 @@ class _WireInput:
         if not line:
             raise StopAsyncIteration
         return line.decode("utf-8", errors="replace")
+
+
+class _OutcomeNotRecorded(AuditError):
+    """The audit log failed after the call had already gone to the upstream."""
 
 
 def _error_result(text: str) -> types.CallToolResult:
@@ -232,9 +238,15 @@ class GuardrailProxy:
             # A call that cannot be recorded is not one this proxy will stand
             # behind, and neither is any call after it.
             self._fail(EXIT_AUDIT, str(exc))
+            if isinstance(exc, _OutcomeNotRecorded):
+                return _error_result(
+                    "mcp-guardrail-proxy could not write its audit log and is shutting down rather "
+                    f"than continue unaudited. The call to '{params.name}' was forwarded to the upstream "
+                    "before the log failed and may have taken effect; its result is withheld."
+                )
             return _error_result(
                 "mcp-guardrail-proxy could not write its audit log and is shutting down "
-                "rather than continue unaudited. The result of this call is withheld."
+                "rather than continue unaudited. The call was not forwarded."
             )
         finally:
             self._in_flight -= 1
@@ -494,7 +506,16 @@ class GuardrailProxy:
         approver: Optional[str] = None,
         reason: Optional[str] = None,
     ) -> types.CallToolResult:
-        """Send the call upstream, record how it went, and return the result untouched."""
+        """Send the call upstream, record how it went, and return the result untouched.
+
+        Two lines per forwarded call: `pending` before it leaves, then the
+        outcome. The first is the only one that can be relied on to exist. A
+        proxy that is killed, or whose disk fills, while the upstream is
+        working cannot write anything afterwards, and by then the call cannot
+        be taken back. Checking that the log can be opened is not enough,
+        because a full disk still opens files, so the guard is the write
+        itself: if it fails, nothing has been sent.
+        """
 
         def record(status: str, note: Optional[str] = reason) -> None:
             self._record(
@@ -509,14 +530,18 @@ class GuardrailProxy:
                 upstream_status=status,
             )
 
-        # Checked before the call leaves, not only after: once forwarded, a
-        # write cannot be taken back for want of somewhere to record it.
-        self._audit.ensure_writable()
+        def record_outcome(status: str, note: Optional[str] = reason) -> None:
+            try:
+                record(status, note)
+            except AuditError as exc:
+                raise _OutcomeNotRecorded(str(exc)) from exc
+
+        record(PENDING)
         try:
             result = await self._upstream.call_tool(name, arguments)
         except MCPError as exc:
             if exc.error.code == types.CONNECTION_CLOSED or self._upstream.closed.is_set():
-                record("connection_lost", "the upstream server exited before answering")
+                record_outcome("connection_lost", "the upstream server exited before answering")
                 self._fail(
                     EXIT_UPSTREAM_LOST,
                     "the upstream server exited or closed its connection (its own error output, if any, is above)",
@@ -529,18 +554,25 @@ class GuardrailProxy:
             # A protocol-level error from the upstream (bad arguments, a tool
             # it no longer has). Passed on as the same error the client would
             # have received from the upstream directly.
-            record("protocol_error", f"upstream error {exc.error.code}: {exc.error.message}")
+            record_outcome("protocol_error", f"upstream error {exc.error.code}: {exc.error.message}")
             raise
         except anyio.get_cancelled_exc_class():
-            record("cancelled", "the call was cancelled after it was forwarded; its effect is unknown")
+            try:
+                record("cancelled", "the call was cancelled after it was forwarded; its effect is unknown")
+            except AuditError as exc:
+                # The cancellation still has to propagate; there is no result
+                # left to carry the news, so it goes to the exit status.
+                self._fail(EXIT_AUDIT, str(exc))
             raise
         except Exception as exc:
-            record("invalid_response", f"{type(exc).__name__}: the upstream's answer was not a valid tool result")
+            record_outcome(
+                "invalid_response", f"{type(exc).__name__}: the upstream's answer was not a valid tool result"
+            )
             return _error_result(
                 f"The upstream MCP server answered the call to '{name}' with something that is not a "
                 "valid tool result, so mcp-guardrail-proxy could not pass it on."
             )
-        record("error" if result.is_error else "ok")
+        record_outcome("error" if result.is_error else "ok")
         return result
 
     def _record(
