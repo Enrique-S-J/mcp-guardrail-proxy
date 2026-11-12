@@ -105,11 +105,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         sys.exit(EXIT_CONFIG)
     if policy.approval.mode == "file":
         try:
-            FileApprover.prepare_directory(policy.approval.directory)
+            warnings = FileApprover.prepare_directory(policy.approval.directory)
             swept = FileApprover.sweep(policy.approval.directory)
         except OSError as exc:
             log(f"error: cannot use approvals directory '{policy.approval.directory}': {exc.strerror or exc}")
             sys.exit(EXIT_CONFIG)
+        for warning in warnings:
+            log(f"warning: {warning}")
         if swept:
             log(
                 f"removed {swept} stale file{'s' if swept != 1 else ''} from the approvals directory "

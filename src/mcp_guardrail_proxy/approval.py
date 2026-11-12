@@ -17,11 +17,13 @@ This module also provides the `mcp-guardrail-approve` command.
 from __future__ import annotations
 
 import argparse
+import errno
 import getpass
 import json
 import math
 import os
 import re
+import stat
 import sys
 import time
 from dataclasses import dataclass
@@ -109,11 +111,43 @@ class FileApprover:
         self.poll_interval_seconds = poll_interval_seconds
 
     @staticmethod
-    def prepare_directory(directory: Path) -> None:
-        """Create the approvals directory, private to the current user, and check it is usable."""
+    def prepare_directory(directory: Path) -> list[str]:
+        """Create the approvals directory, private to the current user, and check it is usable.
+
+        Returns warnings for the operator. A directory this creates is mode
+        0700, but one that already exists keeps whatever access it had, and
+        write access here is the authority to approve. Open to every user is
+        refused outright. Open to a group, or owned by someone else, can be
+        deliberate (approvers who are not the user running the proxy), so
+        those start, and say who that lets approve.
+        """
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not os.access(directory, os.W_OK | os.X_OK):
-            raise PermissionError(13, "Permission denied", str(directory))
+            raise PermissionError(errno.EACCES, "Permission denied", str(directory))
+        if not hasattr(os, "getuid"):
+            # Windows: access is by ACL, which these mode bits do not describe.
+            return []
+        info = directory.stat()
+        mode = stat.S_IMODE(info.st_mode)
+        if mode & stat.S_IWOTH:
+            raise PermissionError(
+                errno.EACCES,
+                f"it is writable by every user on this machine (mode {mode:04o}), and whoever can write "
+                "to it can approve calls. Restrict it (chmod 700) and start again",
+                str(directory),
+            )
+        warnings = []
+        if info.st_uid != os.getuid():
+            warnings.append(
+                f"the approvals directory is owned by another user (uid {info.st_uid}), who can approve "
+                "calls and can change who else may"
+            )
+        if mode & stat.S_IWGRP:
+            warnings.append(
+                f"the approvals directory is group-writable (mode {mode:04o}): every member of its "
+                "group can approve calls"
+            )
+        return warnings
 
     @staticmethod
     def sweep(directory: Path) -> int:

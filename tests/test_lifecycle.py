@@ -13,6 +13,7 @@ import os
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -187,6 +188,36 @@ def test_an_unusable_approvals_directory_stops_the_proxy_at_startup(workspace):
     assert result.returncode == 2
     assert "cannot use approvals directory" in result.stderr
     assert not ws.pid_path.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_an_approvals_directory_anyone_can_write_to_stops_the_proxy_at_startup(workspace):
+    """Write access to the directory is the authority to approve. A directory open to every user gates nothing."""
+    ws = workspace("approval:\n  mode: file\n  directory: approvals\n")
+    ws.approvals_dir.mkdir()
+    ws.approvals_dir.chmod(0o777)
+    result = _run_proxy(*ws.proxy_argv())
+    assert result.returncode == 2
+    assert "cannot use approvals directory" in result.stderr
+    assert "writable by every user on this machine (mode 0777)" in result.stderr
+    assert not ws.pid_path.exists()
+    # Reported, not quietly repaired: the operator may have meant something by it.
+    assert stat.S_IMODE(ws.approvals_dir.stat().st_mode) == 0o777
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+@pytest.mark.parametrize("mode,warned", [(0o770, True), (0o700, False), (None, False)], ids=["group", "private", "created"])
+def test_an_approvals_directory_a_group_can_write_to_is_allowed_but_called_out(workspace, mode, warned):
+    """A shared approvers' group is a legitimate setup. The operator is told who that lets approve."""
+    ws = workspace("approval:\n  mode: file\n  directory: approvals\n")
+    if mode is not None:
+        ws.approvals_dir.mkdir()
+        ws.approvals_dir.chmod(mode)
+    result = _run_proxy(*ws.proxy_argv())
+    assert result.returncode == 0
+    assert ws.pid_path.exists()
+    assert ("warning: the approvals directory is group-writable (mode 0770)" in result.stderr) is warned
+    assert ("can approve calls" in result.stderr) is warned
 
 
 # ---------------------------------------------------------------------------
