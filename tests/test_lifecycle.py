@@ -249,6 +249,20 @@ def test_an_approvals_directory_a_group_can_write_to_is_allowed_but_called_out(w
     assert ("can approve calls" in result.stderr) is warned
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership")
+def test_an_approvals_directory_owned_by_someone_else_is_called_out(tmp_path, monkeypatch):
+    """Called as a function, with the current uid faked: giving a directory away for real takes root."""
+    from mcp_guardrail_proxy.approval import FileApprover
+
+    approvals = tmp_path / "approvals"
+    assert FileApprover.prepare_directory(approvals) == []
+
+    owner = approvals.stat().st_uid
+    monkeypatch.setattr(os, "getuid", lambda: owner + 1)
+    (warning,) = FileApprover.prepare_directory(approvals)
+    assert f"owned by another user (uid {owner})" in warning and "can approve calls" in warning
+
+
 # ---------------------------------------------------------------------------
 # Upstream failures
 # ---------------------------------------------------------------------------
@@ -426,7 +440,9 @@ def test_the_upstream_dying_while_a_call_awaits_approval_answers_that_call(works
 
 posix_only = pytest.mark.skipif(os.name == "nt", reason="POSIX signals")
 STOP_SIGNALS = pytest.mark.parametrize(
-    "signum,status", [(signal.SIGINT, 130), (signal.SIGTERM, 143)], ids=["SIGINT", "SIGTERM"]
+    "signum,status",
+    [(getattr(signal, name), 128 + number) for name, number in (("SIGINT", 2), ("SIGTERM", 15), ("SIGHUP", 1)) if hasattr(signal, name)],
+    ids=lambda value: getattr(value, "name", None),
 )
 
 

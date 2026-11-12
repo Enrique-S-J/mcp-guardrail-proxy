@@ -398,6 +398,13 @@ MUTATIONS = [
         LIFECYCLE + "test_an_approvals_directory_a_group_can_write_to_is_allowed_but_called_out",
     ),
     m(
+        "file approval: a directory owned by another user starts without a warning",
+        "approval.py",
+        "        if info.st_uid != os.getuid():",
+        "        if False:",
+        LIFECYCLE + "test_an_approvals_directory_owned_by_someone_else_is_called_out",
+    ),
+    m(
         "file approval: expires_at is truncated, so it can precede the real deadline",
         "approval.py",
         "_utc(math.ceil(now + self.timeout_seconds))",
@@ -691,6 +698,13 @@ MUTATIONS = [
         "",
         LIFECYCLE + "test_a_stop_signal_ends_the_proxy_promptly_and_takes_the_upstream_with_it",
         LIFECYCLE + "test_a_stop_signal_answers_and_closes_out_a_call_awaiting_approval",
+    ),
+    m(
+        "lifecycle: SIGHUP is left to its default action",
+        "proxy.py",
+        'for name in ("SIGINT", "SIGTERM", "SIGHUP")',
+        'for name in ("SIGINT", "SIGTERM")',
+        LIFECYCLE + "test_a_stop_signal_ends_the_proxy_promptly_and_takes_the_upstream_with_it",
     ),
     m(
         "lifecycle: Ctrl-C during startup is not caught",
