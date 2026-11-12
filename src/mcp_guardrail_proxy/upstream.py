@@ -8,6 +8,7 @@ which the SDK's client session otherwise only reveals on the next request.
 from __future__ import annotations
 
 import os
+import shlex
 import sys
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any, AsyncIterator, Optional, Sequence, TextIO
@@ -131,7 +132,7 @@ async def open_upstream(
     env = {key: value for key, value in os.environ.items() if not value.startswith("()")}
     params = StdioServerParameters(command=command[0], args=list(command[1:]), env=env)
     closed = anyio.Event()
-    shown = " ".join(command)
+    shown = shlex.join(command)
     async with AsyncExitStack() as stack:
         try:
             read_stream, write_stream = await stack.enter_async_context(stdio_client(params, errlog=errlog))
