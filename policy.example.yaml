@@ -1,0 +1,45 @@
+# Example policy for mcp-guardrail-proxy. Copy to policy.yaml and edit.
+#
+# Decision order for each tool call:
+#   1. a rule under `tools:` for that tool name
+#   2. `read_only_passthrough`, if the upstream annotated the tool readOnlyHint: true
+#   3. `default`
+#
+# Unknown keys, duplicate keys, and unrecognised actions stop the proxy at
+# startup. Tool names here are examples; the proxy warns at startup about
+# rules that match no upstream tool.
+
+# What happens to a tool that is not read-only and has no rule of its own.
+# One of: allow, deny, require_approval.
+default: require_approval
+
+# Forward tools the upstream marks readOnlyHint: true without asking.
+# The annotation is the upstream's own claim. Set this to false, or add
+# explicit rules, for an upstream you do not trust to label its tools.
+read_only_passthrough: true
+
+tools:
+  delete_record: deny              # never forwarded
+  send_email:    require_approval
+  get_status:    allow             # forwarded without approval, whatever its annotations
+
+# Argument keys whose values are replaced with "[REDACTED]" in the audit log
+# and in approval requests, at any nesting depth. The upstream still receives
+# the real values. Matching ignores case, "_" and "-", and is exact:
+# `token` does not cover `access_token`.
+redact_fields: [password, token, api_key]
+
+approval:
+  # deny        - require_approval behaves as deny. The default; safe when
+  #               nobody is watching.
+  # file        - wait for <id>.approved or <id>.denied to appear in `directory`
+  #               (see `mcp-guardrail-approve`). Works with any client.
+  # elicitation - ask the human through the MCP client. Only as trustworthy
+  #               as the client relaying the answer.
+  mode: deny
+  # Used by `file`. A relative path is relative to this file.
+  directory: approvals
+  # How long a request waits before it is refused. Keep it below your MCP
+  # client's own request timeout, or the client gives up first.
+  timeout_seconds: 300
+  poll_interval_seconds: 0.5
