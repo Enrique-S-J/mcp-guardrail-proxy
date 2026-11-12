@@ -105,6 +105,34 @@ def test_upstream_paths_with_spaces_work(workspace, raw_peers, tmp_path, separat
     assert proxy.close() == 0
 
 
+@pytest.mark.parametrize(
+    "text,words",
+    [
+        (
+            r"C:\tools\sysops-mcp\.venv\Scripts\python.exe C:\tools\sysops-mcp\server.py",
+            [r"C:\tools\sysops-mcp\.venv\Scripts\python.exe", r"C:\tools\sysops-mcp\server.py"],
+        ),
+        (
+            r'"C:\Program Files\Python\python.exe" "C:\path with spaces\server.py" --flag',
+            [r"C:\Program Files\Python\python.exe", r"C:\path with spaces\server.py", "--flag"],
+        ),
+        (r"'C:\Program Files\python.exe' server.py", [r"C:\Program Files\python.exe", "server.py"]),
+    ],
+    ids=["bare", "double-quoted", "single-quoted"],
+)
+def test_the_windows_rule_for_splitting_upstream_keeps_backslashes(text, words):
+    """Called as a function, on purpose: this is the one rule here that only runs on a platform the suite has not.
+
+    POSIX shell splitting treats a backslash as an escape and drops it, which
+    turns `C:\\tools\\python.exe` into `C:toolspython.exe`.
+    """
+    from mcp_guardrail_proxy.__main__ import split_upstream
+
+    assert split_upstream(text, windows=True) == words
+    # And what the POSIX rule would have made of an unquoted Windows path.
+    assert split_upstream(r"C:\tools\python.exe", windows=False) == ["C:toolspython.exe"]
+
+
 def test_a_clean_disconnect_exits_zero_and_stops_the_upstream(workspace, raw_peers):
     ws = workspace("default: deny\n")
     proxy = raw_peers(RawPeer.proxy(ws))

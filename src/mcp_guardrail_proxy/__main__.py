@@ -25,11 +25,28 @@ from .policy import PolicyError, load_policy
 from .proxy import EXIT_CONFIG, EXIT_INTERRUPTED, EXIT_OK, log, run_proxy
 
 
+def split_upstream(text: str, *, windows: bool = os.name == "nt") -> list[str]:
+    """Split the --upstream string into the command and its arguments.
+
+    Everywhere but Windows this is POSIX shell splitting. On Windows that
+    would be wrong in the worst place: POSIX rules read a backslash as an
+    escape and drop it, so `C:\\tools\\python.exe` would arrive as
+    `C:toolspython.exe`. There, backslashes are kept as they are and quotes
+    only group: an argument containing spaces is quoted as a whole.
+    """
+    if not windows:
+        return shlex.split(text)
+    words = shlex.split(text, posix=False)
+    # Non-POSIX mode leaves the quotes on a quoted word.
+    return [word[1:-1] if len(word) >= 2 and word[0] == word[-1] and word[0] in "\"'" else word for word in words]
+
+
 def _parse_args(argv: Sequence[str]) -> tuple[argparse.Namespace, list[str]]:
     """Parse options and work out the upstream command.
 
     The upstream is either one string given to --upstream, split the way a
-    shell would split it, or everything after a bare `--`, taken as-is. The
+    shell would split it (see `split_upstream`), or everything after a bare
+    `--`, taken as-is. The
     second form needs no nested quoting, which matters when a path has spaces
     and the whole thing is already inside a JSON config file.
     """
@@ -70,7 +87,7 @@ def _parse_args(argv: Sequence[str]) -> tuple[argparse.Namespace, list[str]]:
         parser.error("give the upstream command either with --upstream or after '--', not both")
     if args.upstream is not None:
         try:
-            command = shlex.split(args.upstream)
+            command = split_upstream(args.upstream)
         except ValueError as exc:
             parser.error(f"--upstream is not a valid command line: {exc}")
     else:
