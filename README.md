@@ -272,17 +272,20 @@ python scripts/mutation_check.py     # about six minutes; edits src/ in place an
 
 ### Verified and pending
 
-Verified, on macOS (Apple Silicon):
+Verified locally, on macOS (Apple Silicon):
 
 - The test suite on Python 3.13 and 3.15 with `mcp` 2.3.0, and on Python 3.13 with `mcp` 2.0.0, the oldest version the package allows.
 - The mutation check: 84 of 84 caught, on Python 3.15 with `mcp` 2.3.0.
 - The sysops-mcp demo above, with the proxy on `mcp` 2.3.0 and sysops-mcp on `mcp` 2.0.0.
 - Installing from a fresh clone by the quickstart steps and running the tests there. The clone was of the local repository, made before it was pushed anywhere.
 
+Verified in CI, on GitHub Actions (2026-11-17):
+
+- The test suite on Ubuntu and on macOS, each with Python 3.10, 3.11, 3.12 and 3.13.
+
 Pending:
 
-- **Linux and Windows.** Not run. A CI workflow for Linux and macOS across Python 3.10 to 3.13 is in the repo but has not run yet. Nothing has been tried on Windows, where three things also differ by design: only Ctrl-C is handled as a stop signal, the approvals directory's permissions are not checked, and `--upstream` is split by a Windows rule that has been tested as a function only.
-- **Python 3.10 to 3.12.** Declared supported, not yet run.
+- **Windows.** Not run, locally or in CI. Three things also differ there by design: only Ctrl-C is handled as a stop signal, the approvals directory's permissions are not checked, and `--upstream` is split by a Windows rule that has been tested as a function only.
 - **Claude Desktop and other GUI clients.** The config example passes the same arguments the tests and the demo pass, but has not been loaded into Claude Desktop.
 - **Elicitation against a third-party client.** Tested only with the Python SDK's own client, at both protocol versions.
 - **Upstreams other than sysops-mcp and the test fake**, such as servers written with the TypeScript SDK.
