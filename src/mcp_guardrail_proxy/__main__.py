@@ -10,6 +10,7 @@ MCP client, with the real server's command passed to it as the upstream.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import shlex
 import sys
@@ -23,6 +24,14 @@ from .approval import FileApprover
 from .audit import AuditError, AuditLog, make_redactor
 from .policy import PolicyError, load_policy
 from .proxy import EXIT_CONFIG, EXIT_INTERRUPTED, EXIT_OK, log, run_proxy
+
+# What a Ctrl-C taken by the event loop's runner comes out of anyio.run() as.
+# The runner cancels the main task and turns the cancellation back into
+# KeyboardInterrupt through Task.uncancel(). Python 3.10 has no uncancel(), so
+# anyio's backport of the runner re-raises the bare CancelledError there.
+_INTERRUPTS: tuple[type[BaseException], ...] = (
+    (KeyboardInterrupt,) if sys.version_info >= (3, 11) else (KeyboardInterrupt, asyncio.CancelledError)
+)
 
 
 def split_upstream(text: str, *, windows: bool = os.name == "nt") -> list[str]:
@@ -137,7 +146,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     try:
         status = anyio.run(lambda: run_proxy(command, policy, audit, redact, startup_timeout=args.startup_timeout))
-    except KeyboardInterrupt:
+    except _INTERRUPTS:
         # Ctrl-C while no signal receiver was listening: the upstream was
         # still starting, or the event loop has no signal support (Windows).
         # The event loop has already unwound and shut the upstream down.

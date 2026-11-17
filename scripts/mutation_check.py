@@ -709,7 +709,7 @@ MUTATIONS = [
     m(
         "lifecycle: Ctrl-C during startup is not caught",
         "__main__.py",
-        "    except KeyboardInterrupt:\n",
+        "    except _INTERRUPTS:\n",
         "    except ZeroDivisionError:\n",
         LIFECYCLE + "test_ctrl_c_while_the_upstream_is_still_starting_exits_130_without_a_traceback",
     ),
